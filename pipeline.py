@@ -723,24 +723,177 @@ def step_normalize(terrain_paths: Dict[str, Path], lc_path: Optional[Path],
 
 
 # ════════════════════════════════════════════════════════
-#  STEP 9: PNG MAP GENERATION
+#  STEP 9: PNG MAP GENERATION (ArcGIS-Style)
 # ════════════════════════════════════════════════════════
-def _make_fig(boundary_utm: gpd.GeoDataFrame, title: str):
-    """Create a figure with province boundary."""
-    fig, ax = plt.subplots(1, 1, figsize=(12, 10))
-    boundary_utm.boundary.plot(ax=ax, color='#333333', linewidth=1.5, zorder=10)
-    ax.set_title(title, fontsize=16, fontweight='bold', pad=15)
-    ax.set_xlabel('Easting (m)', fontsize=10)
-    ax.set_ylabel('Northing (m)', fontsize=10)
+
+# --- ArcGIS-style theme constants ---
+_ARCGIS_BG = '#F5F5F0'          # Canvas beige
+_ARCGIS_FRAME = '#2B2B2B'       # Dark frame
+_ARCGIS_GRID = '#C0C0C0'        # Subtle grid
+_ARCGIS_LABEL = '#333333'       # Axis labels
+_ARCGIS_TITLE_BG = '#2B2B2B'    # Title banner
+_ARCGIS_TITLE_FG = '#FFFFFF'    # Title text
+_ARCGIS_DPI = 200
+
+
+def _arcgis_theme():
+    """Apply ArcGIS-like matplotlib rcParams."""
+    plt.rcParams.update({
+        'font.family': 'sans-serif',
+        'font.sans-serif': ['Arial', 'Helvetica', 'DejaVu Sans'],
+        'font.size': 9,
+        'axes.facecolor': _ARCGIS_BG,
+        'figure.facecolor': _ARCGIS_BG,
+        'axes.edgecolor': _ARCGIS_FRAME,
+        'axes.linewidth': 1.2,
+        'axes.labelcolor': _ARCGIS_LABEL,
+        'xtick.color': _ARCGIS_LABEL,
+        'ytick.color': _ARCGIS_LABEL,
+        'axes.grid': False,
+    })
+
+
+def _add_north_arrow(ax, x=0.95, y=0.95, size=0.06):
+    """Draw a north arrow on the axes (in axes-fraction coordinates)."""
+    ax.annotate('N', xy=(x, y), xycoords='axes fraction',
+                ha='center', va='center', fontsize=11, fontweight='bold',
+                color=_ARCGIS_FRAME,
+                bbox=dict(boxstyle='round,pad=0.15', fc='white', ec=_ARCGIS_FRAME,
+                          lw=0.8, alpha=0.9))
+    ax.annotate('', xy=(x, y + size), xycoords='axes fraction',
+                xytext=(x, y + size * 0.35), textcoords='axes fraction',
+                arrowprops=dict(arrowstyle='->', color=_ARCGIS_FRAME, lw=1.8))
+
+
+def _add_scale_bar(ax, transform, length_m=None, y_frac=0.04, x_frac=0.05):
+    """Draw a scale bar in map coordinates (bottom-left)."""
+    xlim = ax.get_xlim()
+    ylim = ax.get_ylim()
+    map_width = xlim[1] - xlim[0]
+
+    if length_m is None:
+        # Auto-pick a nice round number ~20% of map width
+        raw = map_width * 0.2
+        mag = 10 ** int(math.floor(math.log10(raw)))
+        length_m = round(raw / mag) * mag
+        if length_m == 0:
+            length_m = mag
+
+    x0 = xlim[0] + map_width * x_frac
+    y0 = ylim[0] + (ylim[1] - ylim[0]) * y_frac
+    bar_h = (ylim[1] - ylim[0]) * 0.006
+
+    # Draw bar segments (alternating black/white like ArcGIS)
+    n_seg = 4
+    seg_len = length_m / n_seg
+    for i in range(n_seg):
+        color = _ARCGIS_FRAME if i % 2 == 0 else 'white'
+        rect = plt.Rectangle((x0 + i * seg_len, y0), seg_len, bar_h,
+                              facecolor=color, edgecolor=_ARCGIS_FRAME, linewidth=0.6,
+                              zorder=50, clip_on=False)
+        ax.add_patch(rect)
+
+    # Labels
+    if length_m >= 1000:
+        label = f'{length_m / 1000:.0f} km'
+    else:
+        label = f'{length_m:.0f} m'
+
+    ax.text(x0 + length_m / 2, y0 + bar_h * 2.5, label,
+            ha='center', va='bottom', fontsize=7, fontweight='bold',
+            color=_ARCGIS_FRAME, zorder=51,
+            bbox=dict(boxstyle='round,pad=0.1', fc='white', ec='none', alpha=0.7))
+    ax.text(x0, y0 - bar_h * 1.5, '0', ha='center', va='top',
+            fontsize=5.5, color=_ARCGIS_LABEL, zorder=51)
+    ax.text(x0 + length_m, y0 - bar_h * 1.5,
+            f'{length_m / 1000:.0f} km' if length_m >= 1000 else f'{length_m:.0f} m',
+            ha='center', va='top', fontsize=5.5, color=_ARCGIS_LABEL, zorder=51)
+
+
+def _compute_hillshade(dem: np.ndarray, cell_size: float,
+                       azimuth: float = 315, altitude: float = 45):
+    """Compute ArcGIS-style analytical hillshade (0-255)."""
+    az_rad = math.radians(360 - azimuth + 90)
+    alt_rad = math.radians(altitude)
+    dy, dx = np.gradient(dem, cell_size)
+    slope = np.arctan(np.sqrt(dx**2 + dy**2))
+    aspect = np.arctan2(-dy, dx)
+    hs = (np.sin(alt_rad) * np.cos(slope) +
+          np.cos(alt_rad) * np.sin(slope) * np.cos(az_rad - aspect))
+    hs = np.clip(hs * 255, 0, 255).astype(np.uint8)
+    return hs
+
+
+def _make_fig(boundary_utm: gpd.GeoDataFrame, title: str, figsize=(14, 11)):
+    """Create an ArcGIS-style figure with professional cartographic elements."""
+    _arcgis_theme()
+    fig, ax = plt.subplots(1, 1, figsize=figsize)
+
+    # Province boundary with shadow effect
+    boundary_utm.boundary.plot(ax=ax, color='#555555', linewidth=3.0, zorder=9, alpha=0.3)
+    boundary_utm.boundary.plot(ax=ax, color=_ARCGIS_FRAME, linewidth=1.8, zorder=10)
+
+    # Title banner (ArcGIS-style dark bar at top)
+    ax.set_title(title, fontsize=15, fontweight='bold', color=_ARCGIS_TITLE_FG,
+                 pad=14,
+                 bbox=dict(boxstyle='round,pad=0.4', facecolor=_ARCGIS_TITLE_BG,
+                           edgecolor='none', alpha=0.92))
+
+    # Axis formatting
+    ax.set_xlabel('Easting (m)', fontsize=9, labelpad=8, color=_ARCGIS_LABEL)
+    ax.set_ylabel('Northing (m)', fontsize=9, labelpad=8, color=_ARCGIS_LABEL)
     ax.ticklabel_format(style='plain')
-    ax.tick_params(labelsize=8)
+    ax.tick_params(labelsize=7, length=4, width=0.8, colors=_ARCGIS_LABEL)
+
+    # Subtle coordinate grid
+    ax.grid(True, linestyle=':', linewidth=0.4, color=_ARCGIS_GRID,
+            alpha=0.6, zorder=0)
+
+    # Frame styling
+    for spine in ax.spines.values():
+        spine.set_edgecolor(_ARCGIS_FRAME)
+        spine.set_linewidth(1.2)
+
     return fig, ax
+
+
+def _make_arcgis_colorbar(fig, ax, im, label='', orientation='vertical'):
+    """Create an ArcGIS-style colorbar with professional formatting."""
+    cbar = fig.colorbar(im, ax=ax, fraction=0.028, pad=0.02,
+                        orientation=orientation, shrink=0.85)
+    cbar.ax.tick_params(labelsize=7, length=3, width=0.6, colors=_ARCGIS_LABEL)
+    if label:
+        cbar.set_label(label, fontsize=8, color=_ARCGIS_LABEL, labelpad=8)
+    cbar.outline.set_edgecolor(_ARCGIS_FRAME)
+    cbar.outline.set_linewidth(0.8)
+    return cbar
+
+
+def _finalize_map(fig, ax, out_png, transform=None, attribution=None):
+    """Add north arrow, scale bar, attribution, and save."""
+    _add_north_arrow(ax)
+    if transform is not None:
+        _add_scale_bar(ax, transform)
+
+    if attribution:
+        ax.text(0.99, 0.01, attribution, transform=ax.transAxes,
+                ha='right', va='bottom', fontsize=5, color='#888888',
+                style='italic', zorder=51,
+                bbox=dict(boxstyle='round,pad=0.15', fc='white', ec='none', alpha=0.5))
+
+    fig.tight_layout(pad=1.5)
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=_ARCGIS_DPI, bbox_inches='tight',
+                facecolor=_ARCGIS_BG, edgecolor='none')
+    plt.close(fig)
+    log.info(f"  🗺️  {out_png.name}")
 
 
 def _save_raster_map(raster_path: Path, boundary: gpd.GeoDataFrame,
                      target_crs: str, title: str, out_png: Path,
-                     cmap='terrain', vmin=None, vmax=None, label=''):
-    """Generate PNG for a raster layer."""
+                     cmap='terrain', vmin=None, vmax=None, label='',
+                     hillshade: bool = False, dem_path: Optional[Path] = None):
+    """Generate ArcGIS-style PNG for a raster layer."""
     boundary_utm = boundary.to_crs(target_crs)
     fig, ax = _make_fig(boundary_utm, title)
 
@@ -761,26 +914,42 @@ def _save_raster_map(raster_path: Path, boundary: gpd.GeoDataFrame,
     if vmax is None:
         vmax = np.nanpercentile(data_plot, 98)
 
+    # Hillshade basemap (ArcGIS-style shaded relief)
+    if hillshade:
+        hs_data = None
+        if dem_path and dem_path.exists():
+            with rasterio.open(dem_path) as dem_src:
+                hs_data = dem_src.read(1).astype(float)
+                if dem_src.nodata is not None:
+                    hs_data[dem_src.read(1) == dem_src.nodata] = np.nan
+        else:
+            hs_data = data_plot.copy()
+
+        if hs_data is not None:
+            cs = abs(tf[0])
+            hs_valid = hs_data.copy()
+            hs_valid[np.isnan(hs_valid)] = 0
+            hs = _compute_hillshade(hs_valid, cs)
+            ax.imshow(hs, extent=extent, cmap='gray', vmin=0, vmax=255,
+                      origin='upper', alpha=0.35, zorder=0)
+
     im = ax.imshow(data_plot, extent=extent, cmap=cmap, vmin=vmin, vmax=vmax,
-                   origin='upper', alpha=0.9, zorder=1)
-    cbar = fig.colorbar(im, ax=ax, fraction=0.03, pad=0.04)
-    if label:
-        cbar.set_label(label, fontsize=10)
+                   origin='upper', alpha=0.85 if hillshade else 0.92,
+                   zorder=1, interpolation='bilinear')
+
+    _make_arcgis_colorbar(fig, ax, im, label=label)
 
     ax.set_xlim(extent[0], extent[1])
     ax.set_ylim(extent[2], extent[3])
-    fig.tight_layout()
-    out_png.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_png, dpi=150, bbox_inches='tight', facecolor='white')
-    plt.close(fig)
-    log.info(f"  🗺️  {out_png.name}")
+    _finalize_map(fig, ax, out_png, transform=tf,
+                  attribution='Data: Copernicus DEM / ESA WorldCover')
 
 
 def _save_landcover_map(raster_path: Path, boundary: gpd.GeoDataFrame,
                         target_crs: str, out_png: Path):
-    """Generate PNG for landcover (categorical)."""
+    """Generate ArcGIS-style PNG for landcover (categorical)."""
     boundary_utm = boundary.to_crs(target_crs)
-    fig, ax = _make_fig(boundary_utm, "Land Cover (ESA WorldCover)")
+    fig, ax = _make_fig(boundary_utm, "Land Cover (ESA WorldCover 10m)")
 
     with rasterio.open(raster_path) as src:
         data = src.read(1)
@@ -792,36 +961,60 @@ def _save_landcover_map(raster_path: Path, boundary: gpd.GeoDataFrame,
     # Build colormap
     classes = sorted(LANDCOVER_CLASSES.keys())
     colors_list = [LANDCOVER_CLASSES[c][2] for c in classes]
-    cmap = mcolors.ListedColormap(colors_list)
+    lc_cmap = mcolors.ListedColormap(colors_list)
     bounds_cm = classes + [max(classes) + 10]
-    norm = mcolors.BoundaryNorm(bounds_cm, cmap.N)
+    norm = mcolors.BoundaryNorm(bounds_cm, lc_cmap.N)
 
     data_plot = data.astype(float)
     data_plot[data == 0] = np.nan
 
-    ax.imshow(data_plot, extent=extent, cmap=cmap, norm=norm,
-              origin='upper', alpha=0.9, zorder=1, interpolation='nearest')
+    ax.imshow(data_plot, extent=extent, cmap=lc_cmap, norm=norm,
+              origin='upper', alpha=0.92, zorder=1, interpolation='nearest')
 
-    # Legend
-    patches = [Patch(facecolor=LANDCOVER_CLASSES[c][2], label=LANDCOVER_CLASSES[c][1])
-               for c in classes if c in np.unique(data)]
-    ax.legend(handles=patches, loc='lower right', fontsize=8, framealpha=0.9)
+    # ArcGIS-style legend: framed box with larger patches
+    present = np.unique(data)
+    patches = [Patch(facecolor=LANDCOVER_CLASSES[c][2],
+                     edgecolor='#555555', linewidth=0.5,
+                     label=f'  {LANDCOVER_CLASSES[c][1]}')
+               for c in classes if c in present]
+    legend = ax.legend(handles=patches, loc='lower right', fontsize=7.5,
+                       framealpha=0.95, edgecolor=_ARCGIS_FRAME,
+                       fancybox=False, shadow=False,
+                       title='Land Cover Class', title_fontsize=8,
+                       labelspacing=0.6, handlelength=1.8, handleheight=1.2,
+                       borderpad=0.8)
+    legend.get_frame().set_linewidth(0.8)
+    legend.get_title().set_fontweight('bold')
 
     ax.set_xlim(extent[0], extent[1])
     ax.set_ylim(extent[2], extent[3])
-    fig.tight_layout()
-    out_png.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_png, dpi=150, bbox_inches='tight', facecolor='white')
-    plt.close(fig)
-    log.info(f"  🗺️  {out_png.name}")
+    _finalize_map(fig, ax, out_png, transform=tf,
+                  attribution='Data: ESA WorldCover v200 2021')
 
 
 def _save_vector_map(gpkg_path: Path, boundary: gpd.GeoDataFrame,
                      target_crs: str, title: str, out_png: Path,
-                     color='red', linewidth=0.5):
-    """Generate PNG for a vector layer."""
+                     color='red', linewidth=0.5,
+                     dem_path: Optional[Path] = None):
+    """Generate ArcGIS-style PNG for a vector layer with optional hillshade basemap."""
     boundary_utm = boundary.to_crs(target_crs)
     fig, ax = _make_fig(boundary_utm, title)
+
+    # Optional hillshade basemap for context
+    if dem_path and dem_path.exists():
+        with rasterio.open(dem_path) as src:
+            dem_data = src.read(1).astype(float)
+            tf = src.transform
+            if src.nodata is not None:
+                dem_data[src.read(1) == src.nodata] = np.nan
+        dem_valid = dem_data.copy()
+        dem_valid[np.isnan(dem_valid)] = 0
+        cs = abs(tf[0])
+        hs = _compute_hillshade(dem_valid, cs)
+        extent = [tf[2], tf[2] + tf[0] * dem_data.shape[1],
+                  tf[5] + tf[4] * dem_data.shape[0], tf[5]]
+        ax.imshow(hs, extent=extent, cmap='gray', vmin=0, vmax=255,
+                  origin='upper', alpha=0.25, zorder=0)
 
     gdf = gpd.read_file(gpkg_path).to_crs(target_crs)
 
@@ -833,73 +1026,117 @@ def _save_vector_map(gpkg_path: Path, boundary: gpd.GeoDataFrame,
     if not gdf.empty:
         geom_types = gdf.geometry.type.unique()
         if any(t in ['Point', 'MultiPoint'] for t in geom_types):
-            gdf.plot(ax=ax, color=color, markersize=1, alpha=0.7, zorder=5)
+            gdf.plot(ax=ax, color=color, markersize=2, alpha=0.8, zorder=5,
+                     edgecolor='white', linewidth=0.2)
         else:
-            gdf.plot(ax=ax, color=color, linewidth=linewidth, alpha=0.8, zorder=5)
+            # Outer glow effect
+            gdf.plot(ax=ax, color='white', linewidth=linewidth + 1.2,
+                     alpha=0.4, zorder=4)
+            gdf.plot(ax=ax, color=color, linewidth=linewidth,
+                     alpha=0.9, zorder=5)
 
     b = boundary_utm.total_bounds
     ax.set_xlim(b[0], b[2])
     ax.set_ylim(b[1], b[3])
-    fig.tight_layout()
-    out_png.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_png, dpi=150, bbox_inches='tight', facecolor='white')
-    plt.close(fig)
-    log.info(f"  🗺️  {out_png.name}")
+    _finalize_map(fig, ax, out_png, attribution='Data: © OpenStreetMap contributors')
 
 
 def _save_contour_map(shp_path: Path, boundary: gpd.GeoDataFrame,
-                      target_crs: str, out_png: Path):
-    """Generate PNG for contour lines."""
+                      target_crs: str, out_png: Path,
+                      dem_path: Optional[Path] = None,
+                      interval: float = 10.0):
+    """Generate ArcGIS-style contour map with major/minor line differentiation."""
     boundary_utm = boundary.to_crs(target_crs)
-    fig, ax = _make_fig(boundary_utm, "Contour Lines (10m interval)")
+    fig, ax = _make_fig(boundary_utm, f"Contour Lines ({interval:.0f}m interval)")
+
+    # Hillshade basemap
+    if dem_path and dem_path.exists():
+        with rasterio.open(dem_path) as src:
+            dem_data = src.read(1).astype(float)
+            tf = src.transform
+            if src.nodata is not None:
+                dem_data[src.read(1) == src.nodata] = np.nan
+        dem_valid = dem_data.copy()
+        dem_valid[np.isnan(dem_valid)] = 0
+        cs = abs(tf[0])
+        hs = _compute_hillshade(dem_valid, cs)
+        extent = [tf[2], tf[2] + tf[0] * dem_data.shape[1],
+                  tf[5] + tf[4] * dem_data.shape[0], tf[5]]
+        ax.imshow(hs, extent=extent, cmap='gray', vmin=0, vmax=255,
+                  origin='upper', alpha=0.3, zorder=0)
 
     gdf = gpd.read_file(shp_path).to_crs(target_crs)
     if not gdf.empty:
-        gdf.plot(ax=ax, column='elevation', cmap='terrain', linewidth=0.3,
-                 alpha=0.8, zorder=5, legend=True,
-                 legend_kwds={'label': 'Elevation (m)', 'shrink': 0.6})
+        # Determine major interval (every 5th contour)
+        major_interval = interval * 5
+        gdf['is_major'] = (gdf['elevation'] % major_interval) < 0.01
+
+        # Minor contours
+        minor = gdf[~gdf['is_major']]
+        if not minor.empty:
+            minor.plot(ax=ax, color='#8B6914', linewidth=0.2, alpha=0.55, zorder=4)
+
+        # Major contours (bold, darker)
+        major = gdf[gdf['is_major']]
+        if not major.empty:
+            major.plot(ax=ax, color='#654321', linewidth=0.7, alpha=0.85, zorder=5)
+
+        # Legend
+        legend_handles = [
+            Line2D([0], [0], color='#654321', linewidth=1.5,
+                   label=f'Major ({major_interval:.0f}m)'),
+            Line2D([0], [0], color='#8B6914', linewidth=0.5, alpha=0.6,
+                   label=f'Minor ({interval:.0f}m)'),
+        ]
+        leg = ax.legend(handles=legend_handles, loc='lower right', fontsize=7.5,
+                        framealpha=0.95, edgecolor=_ARCGIS_FRAME,
+                        fancybox=False, title='Contour Lines', title_fontsize=8,
+                        borderpad=0.8)
+        leg.get_frame().set_linewidth(0.8)
+        leg.get_title().set_fontweight('bold')
 
     b = boundary_utm.total_bounds
     ax.set_xlim(b[0], b[2])
     ax.set_ylim(b[1], b[3])
-    fig.tight_layout()
-    out_png.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_png, dpi=150, bbox_inches='tight', facecolor='white')
-    plt.close(fig)
-    log.info(f"  🗺️  {out_png.name}")
+    _finalize_map(fig, ax, out_png, attribution='Data: Copernicus DEM 30m')
 
 
 def step_maps(output_dir: Path, boundary: gpd.GeoDataFrame, target_crs: str,
               raster_paths: dict, osm_paths: dict,
               dist_paths: dict, contour_path: Optional[Path]):
-    """Generate PNG maps for all layers."""
+    """Generate ArcGIS-style PNG maps for all layers."""
     log.info("═" * 60)
-    log.info("🗺️  STEP 9: PNG Map Generation")
+    log.info("🗺️  STEP 9: PNG Map Generation (ArcGIS-Style)")
     log.info("═" * 60)
 
     maps_dir = output_dir / "maps"
 
-    # Raster maps
+    # Get DEM path for hillshade overlays
+    dem_path = raster_paths.get('dem')
+
+    # ArcGIS-style colormaps for each layer
     raster_configs = {
-        'dem':               ('DEM (Elevation)',        'terrain',   'Elevation (m)'),
-        'slope':             ('Slope',                  'Reds',      'Degrees'),
-        'aspect':            ('Aspect',                 'hsv',       'Degrees'),
-        'curvature':         ('Curvature',              'RdBu_r',   'Curvature'),
-        'flow_accumulation': ('Flow Accumulation',      'Blues',     'Cells'),
-        'twi':               ('Topographic Wetness Index', 'YlGnBu', 'TWI'),
+        'dem':               ('DEM — Elevation',          'gist_earth', 'Elevation (m)',   True),
+        'slope':             ('Slope Angle',              'YlOrRd',     'Degrees (°)',     True),
+        'aspect':            ('Aspect (Compass Direction)', 'twilight',  'Degrees (°)',     False),
+        'curvature':         ('Profile Curvature',        'RdBu_r',     'Curvature',       True),
+        'flow_accumulation': ('Flow Accumulation (D8)',    'Blues',      'Upstream Cells',  True),
+        'twi':               ('Topographic Wetness Index', 'YlGnBu',    'TWI',             True),
     }
-    for name, (title, cmap, label) in raster_configs.items():
+    for name, (title, cmap, label, use_hs) in raster_configs.items():
         if name in raster_paths and raster_paths[name].exists():
             vmin, vmax = None, None
             if name == 'flow_accumulation':
-                vmin, vmax = 1, None  # log scale would be better
+                vmin, vmax = 1, None
             _save_raster_map(
                 raster_paths[name], boundary, target_crs,
                 title, maps_dir / f"{name}.png", cmap=cmap, label=label,
                 vmin=vmin, vmax=vmax,
+                hillshade=use_hs,
+                dem_path=dem_path if use_hs and name != 'dem' else None,
             )
 
-    # Landcover
+    # Landcover map
     if 'landcover' in raster_paths and raster_paths['landcover'].exists():
         _save_landcover_map(raster_paths['landcover'], boundary, target_crs,
                             maps_dir / "landcover.png")
@@ -910,23 +1147,25 @@ def step_maps(output_dir: Path, boundary: gpd.GeoDataFrame, target_crs: str,
             title = name.replace('_', ' ').title()
             _save_raster_map(path, boundary, target_crs, title,
                              maps_dir / f"{name}.png",
-                             cmap='YlOrRd_r', label='Distance (m)')
+                             cmap='YlOrRd_r', label='Distance (m)',
+                             hillshade=True, dem_path=dem_path)
 
-    # Vector maps
+    # Vector maps (with hillshade basemap)
     vec_configs = {
-        'roads': ('Roads (OpenStreetMap)', '#E63946', 0.3),
-        'rivers': ('Rivers (OpenStreetMap)', '#1D3557', 0.8),
-        'infrastructure': ('Infrastructure (OpenStreetMap)', '#E9C46A', 0.5),
+        'roads': ('Road Network (OSM)', '#D62828', 0.4),
+        'rivers': ('Hydrographic Network (OSM)', '#1565C0', 0.9),
+        'infrastructure': ('Infrastructure (OSM)', '#FF8F00', 0.5),
     }
     for name, (title, color, lw) in vec_configs.items():
         if name in osm_paths and osm_paths[name] and osm_paths[name].exists():
             _save_vector_map(osm_paths[name], boundary, target_crs,
-                             title, maps_dir / f"{name}.png", color=color, linewidth=lw)
+                             title, maps_dir / f"{name}.png",
+                             color=color, linewidth=lw, dem_path=dem_path)
 
-    # Contour
+    # Contour map (with hillshade basemap)
     if contour_path and contour_path.exists():
         _save_contour_map(contour_path, boundary, target_crs,
-                          maps_dir / "contour.png")
+                          maps_dir / "contour.png", dem_path=dem_path)
 
 
 # ════════════════════════════════════════════════════════
