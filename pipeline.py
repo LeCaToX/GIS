@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
 """
 =========================================================
- Provincial Landslide Prediction GIS Pipeline (Vietnam)
+ Provincial GIS Pipeline (Vietnam)
+ Supports 2025 Province Merger (NQ 202/2025/QH15)
 =========================================================
 Usage:
-    python pipeline.py --province "Lao Cai"
-    python pipeline.py --province "Ha Giang" --resolution 10
+    python pipeline.py --province "Quảng Ngãi"                       # 2025 merged
+    python pipeline.py --province "Hồ Chí Minh" --resolution 10     # 2025 merged
+    python pipeline.py --province "Lào Cai" --legacy-boundaries      # Old GADM boundary
+    python pipeline.py --list-provinces                              # Show all provinces
 
-Downloads and processes all geospatial layers for landslide prediction.
-All rasters normalized to same CRS, resolution, extent.
-PNG maps generated for each layer overlaid on province boundary.
+Downloads and processes geospatial + socioeconomic layers:
+  - Terrain: DEM, slope, aspect, curvature, flow accumulation, TWI
+  - Landcover: ESA WorldCover 10m
+  - Infrastructure: OSM roads, rivers, buildings
+  - Demographics: WorldPop population density
+  - Socioeconomic report: area, population, urbanization, land use
+
+2025 Merger: Automatically dissolves old province boundaries into the
+new 34-unit administrative structure per Nghị quyết 202/2025/QH15.
 """
 
 import os
@@ -33,6 +42,7 @@ from typing import Tuple, List, Optional, Dict
 
 import click
 import numpy as np
+import pandas as pd
 import geopandas as gpd
 import rasterio
 from rasterio.merge import merge
@@ -79,10 +89,99 @@ LANDCOVER_CLASSES = {
     100: ("Moss/lichen", "Moss/Lichen", "#FAE6A0"),
 }
 
+# WorldPop population raster (Vietnam 2020, 1km UN-adjusted)
+WORLDPOP_URL = (
+    "https://data.worldpop.org/GIS/Population/"
+    "Global_2000_2020_1km_UNadj/2020/VNM/"
+    "vnm_ppp_2020_1km_Aggregated_UNadj.tif"
+)
+WORLDPOP_FALLBACK_URL = (
+    "https://data.worldpop.org/GIS/Population/"
+    "Global_2000_2020_1km/2020/VNM/"
+    "vnm_ppp_2020_1km_Aggregated.tif"
+)
+
+# ════════════════════════════════════════════════════════
+#  PROVINCE MERGER 2025 (Nghị quyết 202/2025/QH15)
+#  63 tỉnh/thành → 34 đơn vị (28 tỉnh + 6 TP trực thuộc TW)
+#  Effective: 01/07/2025
+# ════════════════════════════════════════════════════════
+PROVINCE_MERGER_2025 = {
+    # --- 23 tỉnh/thành mới hình thành (sáp nhập) ---
+    "Tuyên Quang":  ["Hà Giang", "Tuyên Quang"],
+    "Lào Cai":      ["Yên Bái", "Lào Cai"],
+    "Thái Nguyên":  ["Bắc Kạn", "Thái Nguyên"],
+    "Phú Thọ":      ["Vĩnh Phúc", "Hòa Bình", "Phú Thọ"],
+    "Bắc Ninh":     ["Bắc Giang", "Bắc Ninh"],
+    "Hải Phòng":    ["Hải Dương", "Hải Phòng"],
+    "Hưng Yên":     ["Thái Bình", "Hưng Yên"],
+    "Ninh Bình":    ["Hà Nam", "Nam Định", "Ninh Bình"],
+    "Quảng Trị":    ["Quảng Bình", "Quảng Trị"],
+    "Đà Nẵng":      ["Quảng Nam", "Đà Nẵng"],
+    "Quảng Ngãi":   ["Kon Tum", "Quảng Ngãi"],
+    "Gia Lai":      ["Bình Định", "Gia Lai"],
+    "Khánh Hòa":    ["Ninh Thuận", "Khánh Hòa"],
+    "Lâm Đồng":     ["Đắk Nông", "Bình Thuận", "Lâm Đồng"],
+    "Đắk Lắk":      ["Phú Yên", "Đắk Lắk"],
+    "Hồ Chí Minh":  ["Bình Dương", "Bà Rịa - Vũng Tàu", "Hồ Chí Minh"],
+    "Đồng Nai":     ["Bình Phước", "Đồng Nai"],
+    "Tây Ninh":     ["Long An", "Tây Ninh"],
+    "Cần Thơ":      ["Sóc Trăng", "Hậu Giang", "Cần Thơ"],
+    "Vĩnh Long":    ["Bến Tre", "Trà Vinh", "Vĩnh Long"],
+    "Đồng Tháp":    ["Tiền Giang", "Đồng Tháp"],
+    "Cà Mau":       ["Bạc Liêu", "Cà Mau"],
+    "An Giang":     ["Kiên Giang", "An Giang"],
+    # --- 11 tỉnh/thành giữ nguyên ---
+    "Cao Bằng":     ["Cao Bằng"],
+    "Điện Biên":    ["Điện Biên"],
+    "Hà Tĩnh":     ["Hà Tĩnh"],
+    "Lai Châu":     ["Lai Châu"],
+    "Lạng Sơn":     ["Lạng Sơn"],
+    "Nghệ An":      ["Nghệ An"],
+    "Quảng Ninh":   ["Quảng Ninh"],
+    "Thanh Hóa":    ["Thanh Hóa"],
+    "Sơn La":       ["Sơn La"],
+    "Hà Nội":       ["Hà Nội"],
+    "Huế":          ["Thừa Thiên Huế"],
+}
+
 
 # ════════════════════════════════════════════════════════
 #  UTILITY FUNCTIONS
 # ════════════════════════════════════════════════════════
+def _normalize_vn(name: str) -> str:
+    """Normalize Vietnamese province name for fuzzy matching.
+    Strips spaces, dashes, dots, and lowercases. Keeps diacritics."""
+    return name.lower().replace(" ", "").replace("-", "").replace(".", "")
+
+
+def _find_merger_match(province: str) -> Optional[Tuple[str, List[str]]]:
+    """Check if province matches any entry in PROVINCE_MERGER_2025.
+    Returns (new_name, [old_names]) or None."""
+    q = _normalize_vn(province)
+    for new_name, old_names in PROVINCE_MERGER_2025.items():
+        if _normalize_vn(new_name) == q or q in _normalize_vn(new_name):
+            return new_name, old_names
+    for new_name, old_names in PROVINCE_MERGER_2025.items():
+        for old in old_names:
+            if _normalize_vn(old) == q or q in _normalize_vn(old):
+                return new_name, old_names
+    return None
+
+
+def _match_gadm_province(gdf: gpd.GeoDataFrame, name: str) -> gpd.GeoDataFrame:
+    """Find GADM features matching a province name (flexible)."""
+    q = _normalize_vn(name)
+    normed = gdf['NAME_1'].apply(_normalize_vn)
+    exact = gdf[normed == q]
+    if not exact.empty:
+        return exact
+    partial = gdf[normed.str.contains(q)]
+    if not partial.empty:
+        return partial.iloc[[0]]
+    return gpd.GeoDataFrame()
+
+
 def download_file(url: str, dest: Path, desc: str = "", retries: int = 3) -> bool:
     """Download a file with retry logic and progress reporting."""
     for attempt in range(retries):
@@ -218,8 +317,13 @@ def clip_raster_to_boundary(src_path: Path, dst_path: Path,
 # ════════════════════════════════════════════════════════
 #  STEP 1: PROVINCE BOUNDARY
 # ════════════════════════════════════════════════════════
-def step_boundary(province: str, output_dir: Path) -> gpd.GeoDataFrame:
-    """Download GADM Vietnam level-1 boundary and filter."""
+def step_boundary(province: str, output_dir: Path,
+                  legacy: bool = False) -> Tuple[gpd.GeoDataFrame, Optional[gpd.GeoDataFrame]]:
+    """Download GADM Vietnam level-1 boundary and filter.
+
+    With 2025 merger support: dissolves constituent province boundaries.
+    Returns (merged_boundary, internal_boundaries_or_None).
+    """
     log.info("═" * 60)
     log.info("📍 STEP 1: Province Boundary")
     log.info("═" * 60)
@@ -230,26 +334,77 @@ def step_boundary(province: str, output_dir: Path) -> gpd.GeoDataFrame:
             raise RuntimeError("Failed to download GADM data")
 
     gdf = gpd.read_file(cache)
-    q = province.lower().strip().replace(" ", "")
-    # Match by removing spaces from both sides
-    match = gdf[gdf['NAME_1'].str.lower().str.replace(" ", "", regex=False).str.contains(q)]
 
-    if match.empty:
-        avail = sorted(gdf['NAME_1'].tolist())
-        log.error(f"Province '{province}' not found! Available:\n" + "\n".join(avail))
-        raise ValueError(f"Province '{province}' not found")
+    # --- Try 2025 merger match first ---
+    merger_match = None if legacy else _find_merger_match(province)
+    internal_boundaries = None
 
-    if len(match) > 1:
-        log.warning(f"Multiple matches: {match['NAME_1'].tolist()}, using first.")
+    if merger_match:
+        new_name, old_names = merger_match
+        log.info(f"  🔄 Merger 2025: {new_name} ← {', '.join(old_names)}")
 
-    boundary = match.iloc[[0]].copy()
-    name = boundary.iloc[0]['NAME_1']
-    log.info(f"  ✅ Province: {name}")
+        parts = []
+        for old in old_names:
+            m = _match_gadm_province(gdf, old)
+            if m.empty:
+                log.warning(f"  ⚠ GADM match not found for '{old}', skipping")
+            else:
+                log.info(f"    ✅ Found: {m.iloc[0]['NAME_1']}")
+                parts.append(m)
+
+        if not parts:
+            raise ValueError(f"No GADM provinces found for merger '{new_name}'")
+
+        constituents = gpd.GeoDataFrame(
+            pd.concat(parts, ignore_index=True), crs=gdf.crs)
+
+        if len(constituents) > 1:
+            internal_boundaries = constituents[['NAME_1', 'geometry']].copy()
+
+        from shapely.ops import unary_union
+        merged_geom = unary_union(constituents.geometry)
+        boundary = gpd.GeoDataFrame(
+            [{'NAME_1': new_name, 'geometry': merged_geom}],
+            crs=gdf.crs,
+        )
+
+        area_km2 = boundary.to_crs(epsg=3405).geometry.area.sum() / 1e6
+        log.info(f"  ✅ Merged province: {new_name}")
+        log.info(f"     Constituents: {len(constituents)} old provinces")
+        log.info(f"     Total area: {area_km2:,.0f} km²")
+
+    else:
+        # --- Legacy single-province match ---
+        q = province.lower().strip().replace(" ", "")
+        match = gdf[gdf['NAME_1'].str.lower().str.replace(
+            " ", "", regex=False).str.contains(q)]
+
+        if match.empty:
+            merged_names = sorted(PROVINCE_MERGER_2025.keys())
+            old_names = sorted(gdf['NAME_1'].tolist())
+            log.error(
+                f"Province '{province}' not found!\n"
+                f"  2025 provinces (34): {', '.join(merged_names)}\n"
+                f"  GADM provinces (63): {', '.join(old_names)}")
+            raise ValueError(f"Province '{province}' not found")
+
+        if len(match) > 1:
+            log.warning(f"Multiple matches: {match['NAME_1'].tolist()}, using first.")
+
+        boundary = match.iloc[[0]].copy()
+        name = boundary.iloc[0]['NAME_1']
+        log.info(f"  ✅ Province (legacy): {name}")
 
     out = output_dir / "boundary.geojson"
     boundary.to_file(out, driver='GeoJSON')
     log.info(f"  ✅ Saved: {out}")
-    return boundary
+
+    if internal_boundaries is not None and len(internal_boundaries) > 1:
+        ib_out = output_dir / "internal_boundaries.geojson"
+        internal_boundaries.to_file(ib_out, driver='GeoJSON')
+        log.info(f"  ✅ Internal boundaries: {ib_out}")
+
+    return boundary, internal_boundaries
 
 
 # ════════════════════════════════════════════════════════
@@ -604,6 +759,234 @@ def step_landcover(boundary: gpd.GeoDataFrame, output_dir: Path) -> Optional[Pat
 
 
 # ════════════════════════════════════════════════════════
+#  STEP 6b: POPULATION (WorldPop)
+# ════════════════════════════════════════════════════════
+def step_population(boundary: gpd.GeoDataFrame, output_dir: Path) -> Optional[Path]:
+    """Download WorldPop population raster for Vietnam, clip to province."""
+    log.info("═" * 60)
+    log.info("👥 STEP 6b: Population (WorldPop 2020 1km)")
+    log.info("═" * 60)
+
+    raw = output_dir / "raw" / "worldpop"
+    raw.mkdir(parents=True, exist_ok=True)
+    wp_file = raw / "vnm_ppp_2020_1km.tif"
+
+    if not wp_file.exists():
+        ok = download_file(WORLDPOP_URL, wp_file, "WorldPop Vietnam 1km")
+        if not ok:
+            log.info("  Trying fallback URL...")
+            ok = download_file(WORLDPOP_FALLBACK_URL, wp_file, "WorldPop Vietnam 1km (fallback)")
+        if not ok:
+            log.warning(
+                "  ⚠ WorldPop download failed. You can manually download from:\n"
+                f"    {WORLDPOP_URL}\n"
+                f"    and place it at: {wp_file}")
+            return None
+    else:
+        log.info(f"  ✅ Cached: {wp_file.name}")
+
+    pop_path = output_dir / "native" / "population.tif"
+    pop_path.parent.mkdir(exist_ok=True)
+    clip_raster_to_boundary(wp_file, pop_path, boundary, "EPSG:4326")
+    log.info(f"  ✅ Population: {pop_path}")
+    return pop_path
+
+
+# ════════════════════════════════════════════════════════
+#  STEP 6c: SOCIOECONOMIC STATISTICS
+# ════════════════════════════════════════════════════════
+def step_socioeconomic(boundary: gpd.GeoDataFrame,
+                       internal_boundaries: Optional[gpd.GeoDataFrame],
+                       pop_path: Optional[Path],
+                       lc_path: Optional[Path],
+                       terrain_paths: Dict[str, Path],
+                       osm_paths: Dict[str, Optional[Path]],
+                       target_crs: str,
+                       output_dir: Path) -> Dict:
+    """Compute socioeconomic statistics for the province."""
+    log.info("═" * 60)
+    log.info("📊 STEP 6c: Socioeconomic Statistics")
+    log.info("═" * 60)
+
+    stats = {}
+    boundary_4326 = boundary.to_crs("EPSG:4326")
+    boundary_proj = boundary.to_crs(epsg=3405)
+
+    # --- Area ---
+    area_m2 = boundary_proj.geometry.area.sum()
+    area_km2 = area_m2 / 1e6
+    stats['area_km2'] = round(area_km2, 2)
+    log.info(f"  Area: {area_km2:,.1f} km²")
+
+    # --- Population from WorldPop ---
+    if pop_path and pop_path.exists():
+        with rasterio.open(pop_path) as src:
+            pop_data = src.read(1).astype(float)
+            nd = src.nodata
+        if nd is not None:
+            pop_data[pop_data == nd] = 0
+        pop_data[pop_data < 0] = 0
+        total_pop = float(np.nansum(pop_data))
+        stats['population'] = round(total_pop)
+        stats['population_density_per_km2'] = round(total_pop / area_km2, 1) if area_km2 > 0 else 0
+        log.info(f"  Population: {total_pop:,.0f}")
+        log.info(f"  Density: {stats['population_density_per_km2']:,.1f} /km²")
+    else:
+        log.warning("  ⚠ No population data available")
+
+    # --- Land cover breakdown ---
+    if lc_path and lc_path.exists():
+        with rasterio.open(lc_path) as src:
+            lc_data = src.read(1)
+            pixel_area_m2 = abs(src.transform[0] * src.transform[4])
+
+        lc_stats = {}
+        for cls_id, (full_name, short_name, _color) in LANDCOVER_CLASSES.items():
+            count = int(np.sum(lc_data == cls_id))
+            area = count * pixel_area_m2 / 1e6
+            pct = 100 * area / area_km2 if area_km2 > 0 else 0
+            if count > 0:
+                lc_stats[short_name] = {
+                    'area_km2': round(area, 2),
+                    'percent': round(pct, 2),
+                }
+        stats['landcover'] = lc_stats
+
+        urban_area = lc_stats.get('Urban', {}).get('area_km2', 0)
+        forest_area = lc_stats.get('Forest', {}).get('area_km2', 0)
+        agri_area = lc_stats.get('Agriculture', {}).get('area_km2', 0)
+        stats['urban_area_km2'] = urban_area
+        stats['urban_percent'] = round(100 * urban_area / area_km2, 2) if area_km2 > 0 else 0
+        stats['forest_area_km2'] = forest_area
+        stats['forest_percent'] = round(100 * forest_area / area_km2, 2) if area_km2 > 0 else 0
+        stats['agriculture_area_km2'] = agri_area
+        stats['agriculture_percent'] = round(100 * agri_area / area_km2, 2) if area_km2 > 0 else 0
+
+        log.info(f"  Urban area: {urban_area:,.1f} km² ({stats['urban_percent']:.1f}%)")
+        log.info(f"  Forest area: {forest_area:,.1f} km² ({stats['forest_percent']:.1f}%)")
+        log.info(f"  Agriculture: {agri_area:,.1f} km² ({stats['agriculture_percent']:.1f}%)")
+
+    # --- Terrain summary ---
+    for layer in ['dem', 'slope']:
+        p = terrain_paths.get(layer)
+        if p and p.exists():
+            with rasterio.open(p) as src:
+                data = src.read(1).astype(float)
+                nd = src.nodata
+            if nd is not None:
+                data[data == nd] = np.nan
+            stats[f'{layer}_mean'] = round(float(np.nanmean(data)), 2)
+            stats[f'{layer}_min'] = round(float(np.nanmin(data)), 2)
+            stats[f'{layer}_max'] = round(float(np.nanmax(data)), 2)
+            stats[f'{layer}_std'] = round(float(np.nanstd(data)), 2)
+            log.info(f"  {layer.upper()}: mean={stats[f'{layer}_mean']:.1f}, "
+                     f"range=[{stats[f'{layer}_min']:.1f}, {stats[f'{layer}_max']:.1f}]")
+
+    # --- OSM infrastructure density ---
+    for layer_name in ['roads', 'rivers']:
+        src_path = osm_paths.get(layer_name)
+        if src_path and Path(src_path).exists():
+            gdf = gpd.read_file(src_path).to_crs(target_crs)
+            line_types = ['LineString', 'MultiLineString']
+            lines = gdf[gdf.geometry.type.isin(line_types)]
+            if not lines.empty:
+                total_length_km = lines.geometry.length.sum() / 1000
+                density = total_length_km / area_km2 if area_km2 > 0 else 0
+                stats[f'{layer_name}_total_km'] = round(total_length_km, 1)
+                stats[f'{layer_name}_density_km_per_km2'] = round(density, 3)
+                log.info(f"  {layer_name.title()}: {total_length_km:,.0f} km "
+                         f"(density: {density:.2f} km/km²)")
+
+    # --- Per-constituent-province stats (for merged provinces) ---
+    if internal_boundaries is not None and pop_path and pop_path.exists():
+        constituent_stats = []
+        for _, row in internal_boundaries.iterrows():
+            sub_name = row['NAME_1']
+            sub_gdf = gpd.GeoDataFrame([row], crs=internal_boundaries.crs)
+            sub_proj = sub_gdf.to_crs(epsg=3405)
+            sub_area = sub_proj.geometry.area.sum() / 1e6
+
+            sub_pop = 0
+            try:
+                from shapely.geometry import mapping as shp_mapping
+                geom_4326 = sub_gdf.to_crs("EPSG:4326").geometry.values[0]
+                with rasterio.open(pop_path) as src:
+                    clipped, _ = rasterio_mask(src, [shp_mapping(geom_4326)],
+                                               crop=True, nodata=0)
+                    sub_pop = float(np.sum(np.maximum(clipped, 0)))
+            except Exception:
+                pass
+
+            constituent_stats.append({
+                'name': sub_name,
+                'area_km2': round(sub_area, 2),
+                'population': round(sub_pop),
+                'density_per_km2': round(sub_pop / sub_area, 1) if sub_area > 0 else 0,
+            })
+            log.info(f"    {sub_name}: {sub_area:,.0f} km², "
+                     f"pop ~{sub_pop:,.0f}, density ~{sub_pop/sub_area:.0f}/km²")
+
+        stats['constituents'] = constituent_stats
+
+    # --- Save report ---
+    report_path = output_dir / "socioeconomic_report.json"
+    with open(report_path, 'w', encoding='utf-8') as f:
+        json.dump(stats, f, ensure_ascii=False, indent=2)
+    log.info(f"  ✅ Report saved: {report_path}")
+
+    # --- Readable text report ---
+    txt_path = output_dir / "socioeconomic_report.txt"
+    with open(txt_path, 'w', encoding='utf-8') as f:
+        name = boundary.iloc[0].get('NAME_1', 'Province')
+        f.write(f"{'═' * 60}\n")
+        f.write(f"  SOCIOECONOMIC PROFILE: {name}\n")
+        f.write(f"{'═' * 60}\n\n")
+        f.write(f"  Area:               {stats.get('area_km2', 'N/A'):>12,} km²\n")
+        if 'population' in stats:
+            f.write(f"  Population (2020):  {stats['population']:>12,}\n")
+            f.write(f"  Pop. density:       {stats['population_density_per_km2']:>12,.1f} /km²\n")
+        f.write(f"\n  LAND USE:\n")
+        f.write(f"  {'─' * 40}\n")
+        if 'urban_area_km2' in stats:
+            f.write(f"  Urban:              {stats['urban_area_km2']:>10,.1f} km²  "
+                    f"({stats['urban_percent']:.1f}%)\n")
+        if 'forest_area_km2' in stats:
+            f.write(f"  Forest:             {stats['forest_area_km2']:>10,.1f} km²  "
+                    f"({stats['forest_percent']:.1f}%)\n")
+        if 'agriculture_area_km2' in stats:
+            f.write(f"  Agriculture:        {stats['agriculture_area_km2']:>10,.1f} km²  "
+                    f"({stats['agriculture_percent']:.1f}%)\n")
+        if 'dem_mean' in stats:
+            f.write(f"\n  TERRAIN:\n")
+            f.write(f"  {'─' * 40}\n")
+            f.write(f"  Elevation (mean):   {stats['dem_mean']:>10,.1f} m\n")
+            f.write(f"  Elevation (range):  {stats['dem_min']:>10,.1f} – "
+                    f"{stats['dem_max']:,.1f} m\n")
+        if 'slope_mean' in stats:
+            f.write(f"  Slope (mean):       {stats['slope_mean']:>10,.1f}°\n")
+        if 'roads_total_km' in stats:
+            f.write(f"\n  INFRASTRUCTURE:\n")
+            f.write(f"  {'─' * 40}\n")
+            f.write(f"  Road network:       {stats['roads_total_km']:>10,.0f} km\n")
+            f.write(f"  Road density:       {stats['roads_density_km_per_km2']:>10,.2f} km/km²\n")
+        if 'rivers_total_km' in stats:
+            f.write(f"  River network:      {stats['rivers_total_km']:>10,.0f} km\n")
+
+        if 'constituents' in stats:
+            f.write(f"\n  CONSTITUENT PROVINCES (pre-merger):\n")
+            f.write(f"  {'─' * 54}\n")
+            f.write(f"  {'Name':<20} {'Area (km²)':>12} {'Pop.':>12} {'Density':>10}\n")
+            f.write(f"  {'─' * 54}\n")
+            for c in stats['constituents']:
+                f.write(f"  {c['name']:<20} {c['area_km2']:>12,.0f} "
+                        f"{c['population']:>12,} {c['density_per_km2']:>10,.0f}\n")
+        f.write(f"\n{'═' * 60}\n")
+    log.info(f"  ✅ Text report: {txt_path}")
+
+    return stats
+
+
+# ════════════════════════════════════════════════════════
 #  STEP 7: DISTANCE RASTERS
 # ════════════════════════════════════════════════════════
 def step_distance(osm_results: dict, grid: dict, boundary: gpd.GeoDataFrame,
@@ -824,10 +1207,24 @@ def _compute_hillshade(dem: np.ndarray, cell_size: float,
     return hs
 
 
-def _make_fig(boundary_utm: gpd.GeoDataFrame, title: str, figsize=(14, 11)):
+def _make_fig(boundary_utm: gpd.GeoDataFrame, title: str, figsize=(14, 11),
+              internal_boundaries_utm: Optional[gpd.GeoDataFrame] = None):
     """Create an ArcGIS-style figure with professional cartographic elements."""
     _arcgis_theme()
     fig, ax = plt.subplots(1, 1, figsize=figsize)
+
+    # Internal boundaries (old province borders, dashed)
+    if internal_boundaries_utm is not None and len(internal_boundaries_utm) > 1:
+        internal_boundaries_utm.boundary.plot(
+            ax=ax, color='#888888', linewidth=0.8, linestyle='--',
+            zorder=8, alpha=0.6)
+        for _, row in internal_boundaries_utm.iterrows():
+            centroid = row.geometry.centroid
+            ax.text(centroid.x, centroid.y, row['NAME_1'],
+                    fontsize=6, ha='center', va='center', color='#666666',
+                    fontweight='bold', alpha=0.7, zorder=8,
+                    bbox=dict(boxstyle='round,pad=0.2', fc='white',
+                              ec='none', alpha=0.5))
 
     # Province boundary with shadow effect
     boundary_utm.boundary.plot(ax=ax, color='#555555', linewidth=3.0, zorder=9, alpha=0.3)
@@ -892,10 +1289,12 @@ def _finalize_map(fig, ax, out_png, transform=None, attribution=None):
 def _save_raster_map(raster_path: Path, boundary: gpd.GeoDataFrame,
                      target_crs: str, title: str, out_png: Path,
                      cmap='terrain', vmin=None, vmax=None, label='',
-                     hillshade: bool = False, dem_path: Optional[Path] = None):
+                     hillshade: bool = False, dem_path: Optional[Path] = None,
+                     internal_boundaries: Optional[gpd.GeoDataFrame] = None):
     """Generate ArcGIS-style PNG for a raster layer."""
     boundary_utm = boundary.to_crs(target_crs)
-    fig, ax = _make_fig(boundary_utm, title)
+    ib_utm = internal_boundaries.to_crs(target_crs) if internal_boundaries is not None else None
+    fig, ax = _make_fig(boundary_utm, title, internal_boundaries_utm=ib_utm)
 
     with rasterio.open(raster_path) as src:
         data = src.read(1)
@@ -946,10 +1345,13 @@ def _save_raster_map(raster_path: Path, boundary: gpd.GeoDataFrame,
 
 
 def _save_landcover_map(raster_path: Path, boundary: gpd.GeoDataFrame,
-                        target_crs: str, out_png: Path):
+                        target_crs: str, out_png: Path,
+                        internal_boundaries: Optional[gpd.GeoDataFrame] = None):
     """Generate ArcGIS-style PNG for landcover (categorical)."""
     boundary_utm = boundary.to_crs(target_crs)
-    fig, ax = _make_fig(boundary_utm, "Land Cover (ESA WorldCover 10m)")
+    ib_utm = internal_boundaries.to_crs(target_crs) if internal_boundaries is not None else None
+    fig, ax = _make_fig(boundary_utm, "Land Cover (ESA WorldCover 10m)",
+                        internal_boundaries_utm=ib_utm)
 
     with rasterio.open(raster_path) as src:
         data = src.read(1)
@@ -995,10 +1397,12 @@ def _save_landcover_map(raster_path: Path, boundary: gpd.GeoDataFrame,
 def _save_vector_map(gpkg_path: Path, boundary: gpd.GeoDataFrame,
                      target_crs: str, title: str, out_png: Path,
                      color='red', linewidth=0.5,
-                     dem_path: Optional[Path] = None):
+                     dem_path: Optional[Path] = None,
+                     internal_boundaries: Optional[gpd.GeoDataFrame] = None):
     """Generate ArcGIS-style PNG for a vector layer with optional hillshade basemap."""
     boundary_utm = boundary.to_crs(target_crs)
-    fig, ax = _make_fig(boundary_utm, title)
+    ib_utm = internal_boundaries.to_crs(target_crs) if internal_boundaries is not None else None
+    fig, ax = _make_fig(boundary_utm, title, internal_boundaries_utm=ib_utm)
 
     # Optional hillshade basemap for context
     if dem_path and dem_path.exists():
@@ -1044,10 +1448,13 @@ def _save_vector_map(gpkg_path: Path, boundary: gpd.GeoDataFrame,
 def _save_contour_map(shp_path: Path, boundary: gpd.GeoDataFrame,
                       target_crs: str, out_png: Path,
                       dem_path: Optional[Path] = None,
-                      interval: float = 10.0):
+                      interval: float = 10.0,
+                      internal_boundaries: Optional[gpd.GeoDataFrame] = None):
     """Generate ArcGIS-style contour map with major/minor line differentiation."""
     boundary_utm = boundary.to_crs(target_crs)
-    fig, ax = _make_fig(boundary_utm, f"Contour Lines ({interval:.0f}m interval)")
+    ib_utm = internal_boundaries.to_crs(target_crs) if internal_boundaries is not None else None
+    fig, ax = _make_fig(boundary_utm, f"Contour Lines ({interval:.0f}m interval)",
+                        internal_boundaries_utm=ib_utm)
 
     # Hillshade basemap
     if dem_path and dem_path.exists():
@@ -1101,20 +1508,111 @@ def _save_contour_map(shp_path: Path, boundary: gpd.GeoDataFrame,
     _finalize_map(fig, ax, out_png, attribution='Data: Copernicus DEM 30m')
 
 
+def _save_population_map(pop_path: Path, boundary: gpd.GeoDataFrame,
+                         target_crs: str, out_png: Path,
+                         internal_boundaries: Optional[gpd.GeoDataFrame] = None):
+    """Generate population density map."""
+    boundary_utm = boundary.to_crs(target_crs)
+    ib_utm = internal_boundaries.to_crs(target_crs) if internal_boundaries is not None else None
+    fig, ax = _make_fig(boundary_utm, "Population Density (WorldPop 2020)",
+                        internal_boundaries_utm=ib_utm)
+
+    with rasterio.open(pop_path) as src:
+        data = src.read(1).astype(float)
+        tf = src.transform
+        nd = src.nodata
+
+    if nd is not None:
+        data[data == nd] = np.nan
+    data[data < 0] = np.nan
+
+    extent = [tf[2], tf[2] + tf[0] * data.shape[1],
+              tf[5] + tf[4] * data.shape[0], tf[5]]
+
+    pop_cmap = plt.cm.YlOrRd.copy()
+    pop_cmap.set_bad(color=_ARCGIS_BG)
+
+    vmax = np.nanpercentile(data[data > 0], 95) if np.any(data > 0) else 1
+    im = ax.imshow(data, extent=extent, cmap=pop_cmap, vmin=0, vmax=vmax,
+                   origin='upper', alpha=0.9, zorder=1, interpolation='bilinear')
+
+    _make_arcgis_colorbar(fig, ax, im, label='Population per pixel')
+
+    ax.set_xlim(extent[0], extent[1])
+    ax.set_ylim(extent[2], extent[3])
+    _finalize_map(fig, ax, out_png, transform=tf,
+                  attribution='Data: WorldPop 2020 UN-adjusted')
+
+
+def _save_socioeconomic_summary_map(boundary: gpd.GeoDataFrame,
+                                    internal_boundaries: Optional[gpd.GeoDataFrame],
+                                    stats: Dict, target_crs: str, out_png: Path):
+    """Generate a summary infographic map showing key socioeconomic indicators."""
+    boundary_utm = boundary.to_crs(target_crs)
+    ib_utm = internal_boundaries.to_crs(target_crs) if internal_boundaries is not None else None
+    name = boundary.iloc[0].get('NAME_1', 'Province')
+    fig, ax = _make_fig(boundary_utm, f"Socioeconomic Profile: {name}",
+                        internal_boundaries_utm=ib_utm)
+
+    boundary_utm.plot(ax=ax, facecolor='#E8F5E9', edgecolor=_ARCGIS_FRAME,
+                      linewidth=1.5, zorder=1)
+
+    if ib_utm is not None and len(ib_utm) > 1:
+        import matplotlib.cm as cm
+        colors = cm.Set3(np.linspace(0, 1, len(ib_utm)))
+        for idx, (_, row) in enumerate(ib_utm.iterrows()):
+            gpd.GeoDataFrame([row], crs=ib_utm.crs).plot(
+                ax=ax, facecolor=colors[idx], edgecolor='#666666',
+                linewidth=0.8, alpha=0.4, zorder=2)
+
+    b = boundary_utm.total_bounds
+    ax.set_xlim(b[0], b[2])
+    ax.set_ylim(b[1], b[3])
+
+    info_lines = []
+    if 'area_km2' in stats:
+        info_lines.append(f"Area: {stats['area_km2']:,.0f} km²")
+    if 'population' in stats:
+        info_lines.append(f"Population: {stats['population']:,.0f}")
+        info_lines.append(f"Density: {stats['population_density_per_km2']:,.0f} /km²")
+    if 'urban_percent' in stats:
+        info_lines.append(f"Urban: {stats['urban_percent']:.1f}%")
+    if 'forest_percent' in stats:
+        info_lines.append(f"Forest: {stats['forest_percent']:.1f}%")
+    if 'agriculture_percent' in stats:
+        info_lines.append(f"Agriculture: {stats['agriculture_percent']:.1f}%")
+    if 'dem_mean' in stats:
+        info_lines.append(f"Elevation: {stats['dem_mean']:.0f}m (mean)")
+    if 'roads_total_km' in stats:
+        info_lines.append(f"Roads: {stats['roads_total_km']:,.0f} km")
+
+    info_text = '\n'.join(info_lines)
+    ax.text(0.03, 0.97, info_text, transform=ax.transAxes,
+            fontsize=8, fontfamily='monospace', verticalalignment='top',
+            bbox=dict(boxstyle='round,pad=0.6', facecolor='white',
+                      edgecolor=_ARCGIS_FRAME, alpha=0.92, linewidth=0.8),
+            zorder=20)
+
+    _finalize_map(fig, ax, out_png,
+                  attribution='NQ 202/2025/QH15 | WorldPop | ESA | OSM')
+
+
 def step_maps(output_dir: Path, boundary: gpd.GeoDataFrame, target_crs: str,
               raster_paths: dict, osm_paths: dict,
-              dist_paths: dict, contour_path: Optional[Path]):
+              dist_paths: dict, contour_path: Optional[Path],
+              pop_path: Optional[Path] = None,
+              internal_boundaries: Optional[gpd.GeoDataFrame] = None,
+              socio_stats: Optional[Dict] = None):
     """Generate ArcGIS-style PNG maps for all layers."""
     log.info("═" * 60)
     log.info("🗺️  STEP 9: PNG Map Generation (ArcGIS-Style)")
     log.info("═" * 60)
 
     maps_dir = output_dir / "maps"
+    ib = internal_boundaries
 
-    # Get DEM path for hillshade overlays
     dem_path = raster_paths.get('dem')
 
-    # ArcGIS-style colormaps for each layer
     raster_configs = {
         'dem':               ('DEM — Elevation',          'gist_earth', 'Elevation (m)',   True),
         'slope':             ('Slope Angle',              'YlOrRd',     'Degrees (°)',     True),
@@ -1134,12 +1632,13 @@ def step_maps(output_dir: Path, boundary: gpd.GeoDataFrame, target_crs: str,
                 vmin=vmin, vmax=vmax,
                 hillshade=use_hs,
                 dem_path=dem_path if use_hs and name != 'dem' else None,
+                internal_boundaries=ib,
             )
 
     # Landcover map
     if 'landcover' in raster_paths and raster_paths['landcover'].exists():
         _save_landcover_map(raster_paths['landcover'], boundary, target_crs,
-                            maps_dir / "landcover.png")
+                            maps_dir / "landcover.png", internal_boundaries=ib)
 
     # Distance rasters
     for name, path in dist_paths.items():
@@ -1148,7 +1647,8 @@ def step_maps(output_dir: Path, boundary: gpd.GeoDataFrame, target_crs: str,
             _save_raster_map(path, boundary, target_crs, title,
                              maps_dir / f"{name}.png",
                              cmap='YlOrRd_r', label='Distance (m)',
-                             hillshade=True, dem_path=dem_path)
+                             hillshade=True, dem_path=dem_path,
+                             internal_boundaries=ib)
 
     # Vector maps (with hillshade basemap)
     vec_configs = {
@@ -1160,12 +1660,26 @@ def step_maps(output_dir: Path, boundary: gpd.GeoDataFrame, target_crs: str,
         if name in osm_paths and osm_paths[name] and osm_paths[name].exists():
             _save_vector_map(osm_paths[name], boundary, target_crs,
                              title, maps_dir / f"{name}.png",
-                             color=color, linewidth=lw, dem_path=dem_path)
+                             color=color, linewidth=lw, dem_path=dem_path,
+                             internal_boundaries=ib)
 
     # Contour map (with hillshade basemap)
     if contour_path and contour_path.exists():
         _save_contour_map(contour_path, boundary, target_crs,
-                          maps_dir / "contour.png", dem_path=dem_path)
+                          maps_dir / "contour.png", dem_path=dem_path,
+                          internal_boundaries=ib)
+
+    # Population density map
+    if pop_path and pop_path.exists():
+        _save_population_map(pop_path, boundary, target_crs,
+                             maps_dir / "population.png",
+                             internal_boundaries=ib)
+
+    # Socioeconomic summary map
+    if socio_stats:
+        _save_socioeconomic_summary_map(
+            boundary, ib, socio_stats, target_crs,
+            maps_dir / "socioeconomic_summary.png")
 
 
 # ════════════════════════════════════════════════════════
@@ -1221,22 +1735,52 @@ def step_stack(raster_paths: dict, dist_paths: dict, output_dir: Path, grid: dic
 #  MAIN CLI
 # ════════════════════════════════════════════════════════
 @click.command()
-@click.option('--province', required=True, help='Province name (Vietnamese)')
+@click.option('--province', default=None, help='Province name (Vietnamese, 2025 or legacy)')
 @click.option('--resolution', default=5.0, type=float, help='Target resolution (m)')
 @click.option('--contour-interval', default=10.0, type=float, help='Contour interval (m)')
 @click.option('--output-dir', default=None, type=str, help='Output directory')
-def main(province, resolution, contour_interval, output_dir):
+@click.option('--legacy-boundaries', is_flag=True, default=False,
+              help='Use old 63-province boundaries (skip 2025 merger)')
+@click.option('--list-provinces', is_flag=True, default=False,
+              help='List all available province names and exit')
+def main(province, resolution, contour_interval, output_dir,
+         legacy_boundaries, list_provinces):
     """
-    Provincial Landslide Prediction GIS Pipeline (Vietnam).
+    Provincial GIS Pipeline (Vietnam).
 
-    Downloads and processes all geospatial layers for a province.
+    Downloads and processes geospatial, demographic, and socioeconomic
+    layers for a province. Supports 2025 merger (NQ 202/2025/QH15):
+    63 provinces → 34 units.
+
+    \b
+    Examples:
+        python pipeline.py --province "Quảng Ngãi"           # 2025: Kon Tum + Quảng Ngãi
+        python pipeline.py --province "Hồ Chí Minh"          # 2025: BD + BRVT + HCM
+        python pipeline.py --province "Lào Cai" --legacy-boundaries  # Old single province
+        python pipeline.py --list-provinces
     """
-    log.info("[*] LANDSLIDE PREDICTION GIS PIPELINE")
-    log.info(f"   Province: {province}")
+    if list_provinces:
+        log.info("═" * 60)
+        log.info("  AVAILABLE PROVINCES")
+        log.info("═" * 60)
+        log.info("\n  ── 2025 Provinces (34 units, NQ 202/2025/QH15) ──")
+        for new_name, old_names in sorted(PROVINCE_MERGER_2025.items()):
+            if len(old_names) > 1:
+                log.info(f"    {new_name:<16} ← {', '.join(old_names)}")
+            else:
+                log.info(f"    {new_name:<16}   (unchanged)")
+        log.info(f"\n  Use --legacy-boundaries to access old 63-province GADM names.")
+        return
+
+    if not province:
+        raise click.UsageError("--province is required (or use --list-provinces)")
+
+    log.info("[*] PROVINCIAL GIS PIPELINE (Vietnam)")
+    log.info(f"   Province:   {province}")
     log.info(f"   Resolution: {resolution}m")
+    log.info(f"   Boundaries: {'Legacy (63 provinces)' if legacy_boundaries else '2025 Merger (34 units)'}")
     log.info("")
 
-    # Setup output directory
     safe_name = province.replace(" ", "_").replace(".", "")
     if output_dir is None:
         output_dir = Path("data") / "province" / safe_name
@@ -1246,8 +1790,9 @@ def main(province, resolution, contour_interval, output_dir):
     log.info(f"   Output: {output_dir.resolve()}")
     log.info("")
 
-    # ── Step 1: Boundary ──
-    boundary = step_boundary(province, output_dir)
+    # ── Step 1: Boundary (with merger support) ──
+    boundary, internal_boundaries = step_boundary(
+        province, output_dir, legacy=legacy_boundaries)
 
     # Determine UTM CRS
     centroid = boundary.to_crs("EPSG:4326").geometry.centroid.iloc[0]
@@ -1266,8 +1811,11 @@ def main(province, resolution, contour_interval, output_dir):
     # ── Step 5: OSM ──
     osm_paths = step_osm(boundary, output_dir)
 
-    # ── Step 6: WorldCover ──
+    # ── Step 6a: WorldCover ──
     lc_path = step_landcover(boundary, output_dir)
+
+    # ── Step 6b: Population ──
+    pop_path = step_population(boundary, output_dir)
 
     # ── Target grid ──
     grid = compute_target_grid(boundary, target_crs, resolution)
@@ -1279,9 +1827,17 @@ def main(province, resolution, contour_interval, output_dir):
     # ── Step 8: Normalize ──
     all_rasters = step_normalize(terrain_paths, lc_path, grid, boundary, output_dir)
 
-    # ── Step 9: Maps ──
+    # ── Step 6c: Socioeconomic statistics ──
+    socio_stats = step_socioeconomic(
+        boundary, internal_boundaries, pop_path, lc_path,
+        terrain_paths, osm_paths, target_crs, output_dir)
+
+    # ── Step 9: Maps (including population + socioeconomic) ──
     step_maps(output_dir, boundary, target_crs, all_rasters, osm_paths,
-              dist_paths, contour_path)
+              dist_paths, contour_path,
+              pop_path=pop_path,
+              internal_boundaries=internal_boundaries,
+              socio_stats=socio_stats)
 
     # ── Step 10: Stack ──
     step_stack(all_rasters, dist_paths, output_dir, grid)
@@ -1291,7 +1847,26 @@ def main(province, resolution, contour_interval, output_dir):
     log.info("═" * 60)
     log.info("🎉 PIPELINE COMPLETE!")
     log.info("═" * 60)
+    prov_name = boundary.iloc[0].get('NAME_1', province)
+    log.info(f"  Province: {prov_name}")
+    if internal_boundaries is not None:
+        old_names = internal_boundaries['NAME_1'].tolist()
+        log.info(f"  Merged from: {', '.join(old_names)}")
     log.info(f"  Output directory: {output_dir.resolve()}")
+
+    if socio_stats:
+        log.info("")
+        log.info("  📊 Key Statistics:")
+        if 'area_km2' in socio_stats:
+            log.info(f"     Area:        {socio_stats['area_km2']:>10,.0f} km²")
+        if 'population' in socio_stats:
+            log.info(f"     Population:  {socio_stats['population']:>10,.0f}")
+            log.info(f"     Density:     {socio_stats['population_density_per_km2']:>10,.0f} /km²")
+        if 'urban_percent' in socio_stats:
+            log.info(f"     Urban:       {socio_stats['urban_percent']:>10.1f}%")
+        if 'forest_percent' in socio_stats:
+            log.info(f"     Forest:      {socio_stats['forest_percent']:>10.1f}%")
+
     log.info("")
     log.info("  📁 Files generated:")
     for f in sorted(output_dir.rglob("*")):
