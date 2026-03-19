@@ -1518,12 +1518,26 @@ def _save_population_map(pop_path: Path, boundary: gpd.GeoDataFrame,
                         internal_boundaries_utm=ib_utm)
 
     with rasterio.open(pop_path) as src:
-        data = src.read(1).astype(float)
-        tf = src.transform
-        nd = src.nodata
+        dst_crs = rasterio.crs.CRS.from_user_input(target_crs)
+        if src.crs != dst_crs:
+            tf, w, h = calculate_default_transform(
+                src.crs, dst_crs, src.width, src.height, *src.bounds)
+            data = np.empty((h, w), dtype=np.float32)
+            reproject(
+                source=src.read(1), destination=data,
+                src_transform=src.transform, src_crs=src.crs,
+                dst_transform=tf, dst_crs=dst_crs,
+                resampling=Resampling.bilinear,
+                src_nodata=src.nodata, dst_nodata=np.nan,
+            )
+            data = data.astype(float)
+        else:
+            data = src.read(1).astype(float)
+            tf = src.transform
+            nd = src.nodata
+            if nd is not None:
+                data[data == nd] = np.nan
 
-    if nd is not None:
-        data[data == nd] = np.nan
     data[data < 0] = np.nan
 
     extent = [tf[2], tf[2] + tf[0] * data.shape[1],
