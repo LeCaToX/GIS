@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Vietnam GIS Explorer</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+  <!-- Header -->
+  <header id="header">
+    <div class="header-left">
+      <h1>Vietnam GIS Explorer</h1>
+      <span class="header-sub">NQ 202/2025 &middot; 34 Provinces</span>
+    </div>
+    <div class="header-right">
+      <select id="province-select">
+        <option value="">-- Select province --</option>
+      </select>
+      <button id="btn-back" class="btn-icon" title="Back to national view" style="display:none">
+        &#x2190; All
+      </button>
+    </div>
+  </header>
+
+  <!-- Layer panel (left) -->
+  <aside id="layer-panel" class="panel panel-left">
+    <div class="panel-header">
+      <h2>Layers</h2>
+      <button id="btn-collapse-layers" class="btn-icon" title="Collapse">&lsaquo;</button>
+    </div>
+    <div class="panel-body" id="layer-body">
+      <p class="muted">Select a processed province to see layers.</p>
+    </div>
+  </aside>
+
+  <!-- Map -->
+  <div id="map"></div>
+
+  <!-- Stats panel (right) -->
+  <aside id="stats-panel" class="panel panel-right hidden">
+    <div class="panel-header">
+      <h2 id="stats-title">Statistics</h2>
+      <button id="btn-close-stats" class="btn-icon" title="Close">&times;</button>
+    </div>
+    <div class="panel-body" id="stats-body"></div>
+  </aside>
+
+  <!-- Processing modal -->
+  <div id="process-modal" class="modal hidden">
+    <div class="modal-content">
+      <h3 id="modal-title">Process Province</h3>
+      <p id="modal-message">This province has not been processed yet. Run the GIS pipeline to generate terrain, landcover, infrastructure, and population layers.</p>
+      <div id="modal-progress" class="hidden">
+        <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+        <p id="progress-text">Processing...</p>
+      </div>
+      <div id="modal-actions">
+        <button id="btn-process" class="btn btn-primary">Process Now</button>
+        <button id="btn-cancel-modal" class="btn">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+  <script src="/static/js/layers.js"></script>
+  <script src="/static/js/stats.js"></script>
+  <script src="/static/js/app.js"></script>
+</body>
+</html>

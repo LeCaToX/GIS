@@ -14,8 +14,11 @@ Downloads and processes geospatial + socioeconomic layers:
   - Terrain: DEM, slope, aspect, curvature, flow accumulation, TWI
   - Landcover: ESA WorldCover 10m
   - Infrastructure: OSM roads, rivers, buildings
-  - Demographics: WorldPop population density
+  - Demographics: GSO Vietnam (Tổng cục Thống kê) official census data
   - Socioeconomic report: area, population, urbanization, land use
+
+Data sources prioritise Vietnamese/regional datasets (GSO, OD Mekong)
+over global ones (WorldPop) wherever possible.
 
 2025 Merger: Automatically dissolves old province boundaries into the
 new 34-unit administrative structure per Nghị quyết 202/2025/QH15.
@@ -72,6 +75,10 @@ log = logging.getLogger(__name__)
 #  CONSTANTS
 # ════════════════════════════════════════════════════════
 GADM_URL = "https://geodata.ucdavis.edu/gadm/gadm4.1/json/gadm41_VNM_1.json"
+OD_MEKONG_BOUNDARY_URL = (
+    "https://data.opendevelopmentmekong.net/dataset/999c96d8-fae0-4b82-9a2b-e481f6f50e12/"
+    "resource/234169fb-ae73-4f23-bbd4-ff20a4fca401/download/diaphantinh.geojson"
+)
 COP_DEM_BASE = "https://copernicus-dem-30m.s3.amazonaws.com"
 ESA_WC_BASE = "https://esa-worldcover.s3.eu-central-1.amazonaws.com/v200/2021/map"
 
@@ -89,17 +96,83 @@ LANDCOVER_CLASSES = {
     100: ("Moss/lichen", "Moss/Lichen", "#FAE6A0"),
 }
 
-# WorldPop population raster (Vietnam 2020, 1km UN-adjusted)
-WORLDPOP_URL = (
-    "https://data.worldpop.org/GIS/Population/"
-    "Global_2000_2020_1km_UNadj/2020/VNM/"
-    "vnm_ppp_2020_1km_Aggregated_UNadj.tif"
-)
-WORLDPOP_FALLBACK_URL = (
-    "https://data.worldpop.org/GIS/Population/"
-    "Global_2000_2020_1km/2020/VNM/"
-    "vnm_ppp_2020_1km_Aggregated.tif"
-)
+# ════════════════════════════════════════════════════════
+#  GSO PROVINCE DATA (Tổng cục Thống kê – 2023 estimates)
+#  Source: gso.gov.vn  /  Statistical Yearbook of Vietnam 2023
+#  Keys match GADM NAME_1 field for direct lookup
+# ════════════════════════════════════════════════════════
+GSO_PROVINCE_DATA = {
+    # Northeast (Đông Bắc)
+    "Hà Giang":     {"population": 910_000,   "area_km2": 7_929.48},
+    "Cao Bằng":     {"population": 576_000,   "area_km2": 6_700.26},
+    "Lạng Sơn":     {"population": 828_000,   "area_km2": 8_310.09},
+    "Tuyên Quang":  {"population": 1_056_000, "area_km2": 5_867.90},
+    "Bắc Kạn":     {"population": 338_000,   "area_km2": 4_859.96},
+    "Thái Nguyên":  {"population": 1_356_000, "area_km2": 3_526.64},
+    "Phú Thọ":     {"population": 1_515_000, "area_km2": 3_534.56},
+    "Bắc Giang":   {"population": 1_884_000, "area_km2": 3_895.59},
+    "Quảng Ninh":   {"population": 1_387_000, "area_km2": 6_178.21},
+    # Northwest (Tây Bắc)
+    "Lào Cai":      {"population": 898_000,   "area_km2": 6_364.03},
+    "Yên Bái":     {"population": 950_000,   "area_km2": 6_887.46},
+    "Điện Biên":   {"population": 705_000,   "area_km2": 9_541.25},
+    "Hòa Bình":    {"population": 979_000,   "area_km2": 4_590.57},
+    "Lai Châu":     {"population": 527_000,   "area_km2": 9_068.79},
+    "Sơn La":       {"population": 1_356_000, "area_km2": 14_123.49},
+    # Red River Delta (Đồng bằng sông Hồng)
+    "Hà Nội":      {"population": 8_146_000, "area_km2": 3_358.60},
+    "Vĩnh Phúc":   {"population": 1_296_000, "area_km2": 1_235.87},
+    "Bắc Ninh":    {"population": 1_447_000, "area_km2": 822.71},
+    "Hải Dương":   {"population": 2_003_000, "area_km2": 1_668.24},
+    "Hải Phòng":   {"population": 2_138_000, "area_km2": 1_561.76},
+    "Hưng Yên":    {"population": 1_340_000, "area_km2": 930.22},
+    "Thái Bình":   {"population": 1_934_000, "area_km2": 1_586.35},
+    "Hà Nam":       {"population": 945_000,   "area_km2": 861.93},
+    "Nam Định":    {"population": 1_852_000, "area_km2": 1_668.57},
+    "Ninh Bình":    {"population": 1_102_000, "area_km2": 1_386.79},
+    # North Central Coast (Bắc Trung Bộ)
+    "Thanh Hóa":   {"population": 3_689_000, "area_km2": 11_114.65},
+    "Nghệ An":     {"population": 3_399_000, "area_km2": 16_481.41},
+    "Hà Tĩnh":    {"population": 1_402_000, "area_km2": 5_990.67},
+    "Quảng Bình":  {"population": 992_000,   "area_km2": 8_065.30},
+    "Quảng Trị":   {"population": 687_000,   "area_km2": 4_621.72},
+    "Thừa Thiên Huế": {"population": 1_257_000, "area_km2": 4_902.44},
+    # South Central Coast + Central Highlands
+    "Đà Nẵng":    {"population": 1_294_000, "area_km2": 1_284.88},
+    "Quảng Nam":    {"population": 1_697_000, "area_km2": 10_574.74},
+    "Quảng Ngãi":  {"population": 1_355_000, "area_km2": 5_155.78},
+    "Bình Định":   {"population": 1_679_000, "area_km2": 6_066.21},
+    "Phú Yên":     {"population": 1_056_000, "area_km2": 5_023.42},
+    "Khánh Hòa":   {"population": 1_371_000, "area_km2": 5_137.79},
+    "Ninh Thuận":  {"population": 720_000,   "area_km2": 3_355.34},
+    "Bình Thuận":  {"population": 1_498_000, "area_km2": 7_943.93},
+    "Kon Tum":      {"population": 589_000,   "area_km2": 9_674.18},
+    "Gia Lai":      {"population": 1_586_000, "area_km2": 15_510.99},
+    "Đắk Lắk":    {"population": 2_016_000, "area_km2": 13_030.50},
+    "Đắk Nông":   {"population": 670_000,   "area_km2": 6_509.27},
+    "Lâm Đồng":   {"population": 1_390_000, "area_km2": 9_783.34},
+    # Southeast (Đông Nam Bộ)
+    "Bình Phước":  {"population": 1_313_000, "area_km2": 6_876.76},
+    "Tây Ninh":     {"population": 1_207_000, "area_km2": 4_041.25},
+    "Bình Dương":  {"population": 2_564_000, "area_km2": 2_694.64},
+    "Đồng Nai":    {"population": 3_227_000, "area_km2": 5_863.60},
+    "Bà Rịa - Vũng Tàu": {"population": 1_303_000, "area_km2": 1_980.98},
+    "Hồ Chí Minh":  {"population": 9_125_000, "area_km2": 2_061.41},
+    # Mekong Delta (Đồng bằng sông Cửu Long)
+    "Long An":      {"population": 1_730_000, "area_km2": 4_494.94},
+    "Tiền Giang":  {"population": 1_898_000, "area_km2": 2_510.61},
+    "Bến Tre":     {"population": 1_331_000, "area_km2": 2_394.81},
+    "Trà Vinh":     {"population": 1_067_000, "area_km2": 2_358.26},
+    "Vĩnh Long":    {"population": 1_100_000, "area_km2": 1_525.73},
+    "Đồng Tháp":  {"population": 1_838_000, "area_km2": 3_383.85},
+    "An Giang":     {"population": 2_057_000, "area_km2": 3_536.68},
+    "Kiên Giang":   {"population": 1_789_000, "area_km2": 6_348.78},
+    "Cần Thơ":     {"population": 1_456_000, "area_km2": 1_438.96},
+    "Hậu Giang":   {"population": 853_000,   "area_km2": 1_621.70},
+    "Sóc Trăng":   {"population": 1_256_000, "area_km2": 3_311.88},
+    "Bạc Liêu":   {"population": 1_105_000, "area_km2": 2_669.01},
+    "Cà Mau":       {"population": 1_369_000, "area_km2": 5_221.19},
+}
 
 # ════════════════════════════════════════════════════════
 #  PROVINCE MERGER 2025 (Nghị quyết 202/2025/QH15)
@@ -331,7 +404,12 @@ def step_boundary(province: str, output_dir: Path,
     cache = output_dir / "raw" / "gadm41_VNM_1.json"
     if not cache.exists():
         if not download_file(GADM_URL, cache, "GADM Vietnam"):
-            raise RuntimeError("Failed to download GADM data")
+            log.info("  Trying OD Mekong (Vietnamese admin boundary)...")
+            od_cache = output_dir / "raw" / "od_mekong_provinces.geojson"
+            if not download_file(OD_MEKONG_BOUNDARY_URL, od_cache,
+                                 "OD Mekong Vietnam Provinces"):
+                raise RuntimeError("Failed to download boundary data from GADM and OD Mekong")
+            cache = od_cache
 
     gdf = gpd.read_file(cache)
 
@@ -759,37 +837,71 @@ def step_landcover(boundary: gpd.GeoDataFrame, output_dir: Path) -> Optional[Pat
 
 
 # ════════════════════════════════════════════════════════
-#  STEP 6b: POPULATION (WorldPop)
+#  STEP 6b: POPULATION (GSO Vietnam – Tổng cục Thống kê)
 # ════════════════════════════════════════════════════════
-def step_population(boundary: gpd.GeoDataFrame, output_dir: Path) -> Optional[Path]:
-    """Download WorldPop population raster for Vietnam, clip to province."""
+def _lookup_gso_population(province_names: List[str]) -> List[Dict]:
+    """Return per-province GSO stats for the given GADM NAME_1 list."""
+    results = []
+    for name in province_names:
+        entry = GSO_PROVINCE_DATA.get(name)
+        if entry:
+            pop = entry['population']
+            area = entry['area_km2']
+            results.append({
+                'name': name,
+                'population': pop,
+                'area_km2': area,
+                'density_per_km2': round(pop / area, 1) if area > 0 else 0,
+            })
+        else:
+            log.warning(f"  ⚠ No GSO data for '{name}'")
+    return results
+
+
+def step_population(boundary: gpd.GeoDataFrame,
+                    internal_boundaries: Optional[gpd.GeoDataFrame],
+                    output_dir: Path) -> Optional[Dict]:
+    """Look up official GSO population statistics for the province."""
     log.info("═" * 60)
-    log.info("👥 STEP 6b: Population (WorldPop 2020 1km)")
+    log.info("👥 STEP 6b: Population (GSO Vietnam 2023)")
     log.info("═" * 60)
 
-    raw = output_dir / "raw" / "worldpop"
-    raw.mkdir(parents=True, exist_ok=True)
-    wp_file = raw / "vnm_ppp_2020_1km.tif"
-
-    if not wp_file.exists():
-        ok = download_file(WORLDPOP_URL, wp_file, "WorldPop Vietnam 1km")
-        if not ok:
-            log.info("  Trying fallback URL...")
-            ok = download_file(WORLDPOP_FALLBACK_URL, wp_file, "WorldPop Vietnam 1km (fallback)")
-        if not ok:
-            log.warning(
-                "  ⚠ WorldPop download failed. You can manually download from:\n"
-                f"    {WORLDPOP_URL}\n"
-                f"    and place it at: {wp_file}")
-            return None
+    if internal_boundaries is not None and len(internal_boundaries) > 1:
+        names = internal_boundaries['NAME_1'].tolist()
     else:
-        log.info(f"  ✅ Cached: {wp_file.name}")
+        name = boundary.iloc[0].get('NAME_1', '')
+        names = [name] if name else []
 
-    pop_path = output_dir / "native" / "population.tif"
-    pop_path.parent.mkdir(exist_ok=True)
-    clip_raster_to_boundary(wp_file, pop_path, boundary, "EPSG:4326")
-    log.info(f"  ✅ Population: {pop_path}")
-    return pop_path
+    constituents = _lookup_gso_population(names)
+    if not constituents:
+        log.warning("  ⚠ Province not found in GSO dataset")
+        return None
+
+    total_pop = sum(c['population'] for c in constituents)
+    total_area = sum(c['area_km2'] for c in constituents)
+    density = round(total_pop / total_area, 1) if total_area > 0 else 0
+
+    result = {
+        'population': total_pop,
+        'area_km2': round(total_area, 2),
+        'density_per_km2': density,
+        'source': 'GSO Vietnam (Tổng cục Thống kê) 2023',
+        'constituents': constituents,
+    }
+
+    log.info(f"  Population: {total_pop:,.0f}  (source: GSO 2023)")
+    log.info(f"  Area (GSO): {total_area:,.1f} km²")
+    log.info(f"  Density:    {density:,.1f} /km²")
+    for c in constituents:
+        log.info(f"    {c['name']:<20} pop {c['population']:>10,}  "
+                 f"({c['density_per_km2']:,.0f}/km²)")
+
+    pop_json = output_dir / "gso_population.json"
+    with open(pop_json, 'w', encoding='utf-8') as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+    log.info(f"  ✅ GSO data: {pop_json}")
+
+    return result
 
 
 # ════════════════════════════════════════════════════════
@@ -797,7 +909,7 @@ def step_population(boundary: gpd.GeoDataFrame, output_dir: Path) -> Optional[Pa
 # ════════════════════════════════════════════════════════
 def step_socioeconomic(boundary: gpd.GeoDataFrame,
                        internal_boundaries: Optional[gpd.GeoDataFrame],
-                       pop_path: Optional[Path],
+                       gso_pop: Optional[Dict],
                        lc_path: Optional[Path],
                        terrain_paths: Dict[str, Path],
                        osm_paths: Dict[str, Optional[Path]],
@@ -809,27 +921,21 @@ def step_socioeconomic(boundary: gpd.GeoDataFrame,
     log.info("═" * 60)
 
     stats = {}
-    boundary_4326 = boundary.to_crs("EPSG:4326")
     boundary_proj = boundary.to_crs(epsg=3405)
 
-    # --- Area ---
+    # --- Area (computed from geometry; GSO value kept for reference) ---
     area_m2 = boundary_proj.geometry.area.sum()
     area_km2 = area_m2 / 1e6
     stats['area_km2'] = round(area_km2, 2)
     log.info(f"  Area: {area_km2:,.1f} km²")
 
-    # --- Population from WorldPop ---
-    if pop_path and pop_path.exists():
-        with rasterio.open(pop_path) as src:
-            pop_data = src.read(1).astype(float)
-            nd = src.nodata
-        if nd is not None:
-            pop_data[pop_data == nd] = 0
-        pop_data[pop_data < 0] = 0
-        total_pop = float(np.nansum(pop_data))
-        stats['population'] = round(total_pop)
+    # --- Population from GSO (Tổng cục Thống kê) ---
+    if gso_pop:
+        total_pop = gso_pop['population']
+        stats['population'] = total_pop
         stats['population_density_per_km2'] = round(total_pop / area_km2, 1) if area_km2 > 0 else 0
-        log.info(f"  Population: {total_pop:,.0f}")
+        stats['population_source'] = gso_pop.get('source', 'GSO Vietnam 2023')
+        log.info(f"  Population: {total_pop:,.0f}  (GSO 2023)")
         log.info(f"  Density: {stats['population_density_per_km2']:,.1f} /km²")
     else:
         log.warning("  ⚠ No population data available")
@@ -897,35 +1003,21 @@ def step_socioeconomic(boundary: gpd.GeoDataFrame,
                 log.info(f"  {layer_name.title()}: {total_length_km:,.0f} km "
                          f"(density: {density:.2f} km/km²)")
 
-    # --- Per-constituent-province stats (for merged provinces) ---
-    if internal_boundaries is not None and pop_path and pop_path.exists():
+    # --- Per-constituent-province stats (GSO data for merged provinces) ---
+    if gso_pop and gso_pop.get('constituents') and len(gso_pop['constituents']) > 1:
         constituent_stats = []
-        for _, row in internal_boundaries.iterrows():
-            sub_name = row['NAME_1']
-            sub_gdf = gpd.GeoDataFrame([row], crs=internal_boundaries.crs)
-            sub_proj = sub_gdf.to_crs(epsg=3405)
-            sub_area = sub_proj.geometry.area.sum() / 1e6
-
-            sub_pop = 0
-            try:
-                from shapely.geometry import mapping as shp_mapping
-                geom_4326 = sub_gdf.to_crs("EPSG:4326").geometry.values[0]
-                with rasterio.open(pop_path) as src:
-                    clipped, _ = rasterio_mask(src, [shp_mapping(geom_4326)],
-                                               crop=True, nodata=0)
-                    sub_pop = float(np.sum(np.maximum(clipped, 0)))
-            except Exception:
-                pass
-
+        for c in gso_pop['constituents']:
+            sub_name = c['name']
+            sub_pop = c['population']
+            sub_area = c['area_km2']
             constituent_stats.append({
                 'name': sub_name,
-                'area_km2': round(sub_area, 2),
-                'population': round(sub_pop),
-                'density_per_km2': round(sub_pop / sub_area, 1) if sub_area > 0 else 0,
+                'area_km2': sub_area,
+                'population': sub_pop,
+                'density_per_km2': c['density_per_km2'],
             })
             log.info(f"    {sub_name}: {sub_area:,.0f} km², "
-                     f"pop ~{sub_pop:,.0f}, density ~{sub_pop/sub_area:.0f}/km²")
-
+                     f"pop {sub_pop:,.0f}, density {c['density_per_km2']:,.0f}/km²")
         stats['constituents'] = constituent_stats
 
     # --- Save report ---
@@ -943,7 +1035,9 @@ def step_socioeconomic(boundary: gpd.GeoDataFrame,
         f.write(f"{'═' * 60}\n\n")
         f.write(f"  Area:               {stats.get('area_km2', 'N/A'):>12,} km²\n")
         if 'population' in stats:
-            f.write(f"  Population (2020):  {stats['population']:>12,}\n")
+            src_tag = stats.get('population_source', 'GSO 2023')
+            f.write(f"  Population ({src_tag}):\n")
+            f.write(f"                      {stats['population']:>12,}\n")
             f.write(f"  Pop. density:       {stats['population_density_per_km2']:>12,.1f} /km²\n")
         f.write(f"\n  LAND USE:\n")
         f.write(f"  {'─' * 40}\n")
@@ -1508,54 +1602,63 @@ def _save_contour_map(shp_path: Path, boundary: gpd.GeoDataFrame,
     _finalize_map(fig, ax, out_png, attribution='Data: Copernicus DEM 30m')
 
 
-def _save_population_map(pop_path: Path, boundary: gpd.GeoDataFrame,
+def _save_population_map(gso_pop: Dict, boundary: gpd.GeoDataFrame,
                          target_crs: str, out_png: Path,
                          internal_boundaries: Optional[gpd.GeoDataFrame] = None):
-    """Generate population density map."""
+    """Generate population density choropleth from GSO census data."""
     boundary_utm = boundary.to_crs(target_crs)
     ib_utm = internal_boundaries.to_crs(target_crs) if internal_boundaries is not None else None
-    fig, ax = _make_fig(boundary_utm, "Population Density (WorldPop 2020)",
+    fig, ax = _make_fig(boundary_utm, "Population Density (GSO 2023)",
                         internal_boundaries_utm=ib_utm)
 
-    with rasterio.open(pop_path) as src:
-        dst_crs = rasterio.crs.CRS.from_user_input(target_crs)
-        if src.crs != dst_crs:
-            tf, w, h = calculate_default_transform(
-                src.crs, dst_crs, src.width, src.height, *src.bounds)
-            data = np.empty((h, w), dtype=np.float32)
-            reproject(
-                source=src.read(1), destination=data,
-                src_transform=src.transform, src_crs=src.crs,
-                dst_transform=tf, dst_crs=dst_crs,
-                resampling=Resampling.bilinear,
-                src_nodata=src.nodata, dst_nodata=np.nan,
-            )
-            data = data.astype(float)
-        else:
-            data = src.read(1).astype(float)
-            tf = src.transform
-            nd = src.nodata
-            if nd is not None:
-                data[data == nd] = np.nan
+    constituents = gso_pop.get('constituents', [])
+    pop_cmap = plt.cm.YlOrRd
 
-    data[data < 0] = np.nan
+    if ib_utm is not None and len(ib_utm) > 1 and len(constituents) > 1:
+        density_lookup = {c['name']: c['density_per_km2'] for c in constituents}
+        densities = [density_lookup.get(row['NAME_1'], 0) for _, row in ib_utm.iterrows()]
+        vmin, vmax = min(densities), max(densities)
+        if vmax <= vmin:
+            vmax = vmin + 1
 
-    extent = [tf[2], tf[2] + tf[0] * data.shape[1],
-              tf[5] + tf[4] * data.shape[0], tf[5]]
+        norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+        for _, row in ib_utm.iterrows():
+            d = density_lookup.get(row['NAME_1'], 0)
+            color = pop_cmap(norm(d))
+            gpd.GeoDataFrame([row], crs=ib_utm.crs).plot(
+                ax=ax, facecolor=color, edgecolor='#666666',
+                linewidth=0.8, alpha=0.85, zorder=2)
+            centroid = row.geometry.centroid
+            label = f"{row['NAME_1']}\n{density_lookup.get(row['NAME_1'], 0):,.0f}/km²"
+            ax.text(centroid.x, centroid.y, label,
+                    fontsize=6, ha='center', va='center', fontweight='bold',
+                    color='#333333', zorder=12,
+                    bbox=dict(boxstyle='round,pad=0.2', fc='white',
+                              ec='none', alpha=0.7))
+    else:
+        d = gso_pop.get('density_per_km2', 0)
+        vmin, vmax = 0, max(d, 1)
+        norm = mcolors.Normalize(vmin=0, vmax=vmax)
+        color = pop_cmap(norm(d))
+        boundary_utm.plot(ax=ax, facecolor=color, edgecolor=_ARCGIS_FRAME,
+                          linewidth=1.5, alpha=0.85, zorder=2)
 
-    pop_cmap = plt.cm.YlOrRd.copy()
-    pop_cmap.set_bad(color=_ARCGIS_BG)
+    sm = plt.cm.ScalarMappable(cmap=pop_cmap, norm=norm)
+    sm.set_array([])
+    _make_arcgis_colorbar(fig, ax, sm, label='Population density (per km²)')
 
-    vmax = np.nanpercentile(data[data > 0], 95) if np.any(data > 0) else 1
-    im = ax.imshow(data, extent=extent, cmap=pop_cmap, vmin=0, vmax=vmax,
-                   origin='upper', alpha=0.9, zorder=1, interpolation='bilinear')
+    total_pop = gso_pop.get('population', 0)
+    ax.text(0.02, 0.02, f"Total: {total_pop:,.0f}", transform=ax.transAxes,
+            fontsize=9, fontweight='bold', va='bottom', color=_ARCGIS_LABEL,
+            zorder=51,
+            bbox=dict(boxstyle='round,pad=0.3', fc='white', ec=_ARCGIS_FRAME,
+                      alpha=0.9, linewidth=0.8))
 
-    _make_arcgis_colorbar(fig, ax, im, label='Population per pixel')
-
-    ax.set_xlim(extent[0], extent[1])
-    ax.set_ylim(extent[2], extent[3])
-    _finalize_map(fig, ax, out_png, transform=tf,
-                  attribution='Data: WorldPop 2020 UN-adjusted')
+    b = boundary_utm.total_bounds
+    ax.set_xlim(b[0], b[2])
+    ax.set_ylim(b[1], b[3])
+    _finalize_map(fig, ax, out_png,
+                  attribution='Data: GSO Vietnam (Tổng cục Thống kê) 2023')
 
 
 def _save_socioeconomic_summary_map(boundary: gpd.GeoDataFrame,
@@ -1608,13 +1711,13 @@ def _save_socioeconomic_summary_map(boundary: gpd.GeoDataFrame,
             zorder=20)
 
     _finalize_map(fig, ax, out_png,
-                  attribution='NQ 202/2025/QH15 | WorldPop | ESA | OSM')
+                  attribution='NQ 202/2025/QH15 | GSO | ESA | OSM')
 
 
 def step_maps(output_dir: Path, boundary: gpd.GeoDataFrame, target_crs: str,
               raster_paths: dict, osm_paths: dict,
               dist_paths: dict, contour_path: Optional[Path],
-              pop_path: Optional[Path] = None,
+              gso_pop: Optional[Dict] = None,
               internal_boundaries: Optional[gpd.GeoDataFrame] = None,
               socio_stats: Optional[Dict] = None):
     """Generate ArcGIS-style PNG maps for all layers."""
@@ -1683,9 +1786,9 @@ def step_maps(output_dir: Path, boundary: gpd.GeoDataFrame, target_crs: str,
                           maps_dir / "contour.png", dem_path=dem_path,
                           internal_boundaries=ib)
 
-    # Population density map
-    if pop_path and pop_path.exists():
-        _save_population_map(pop_path, boundary, target_crs,
+    # Population density map (GSO choropleth)
+    if gso_pop:
+        _save_population_map(gso_pop, boundary, target_crs,
                              maps_dir / "population.png",
                              internal_boundaries=ib)
 
@@ -1828,8 +1931,8 @@ def main(province, resolution, contour_interval, output_dir,
     # ── Step 6a: WorldCover ──
     lc_path = step_landcover(boundary, output_dir)
 
-    # ── Step 6b: Population ──
-    pop_path = step_population(boundary, output_dir)
+    # ── Step 6b: Population (GSO) ──
+    gso_pop = step_population(boundary, internal_boundaries, output_dir)
 
     # ── Target grid ──
     grid = compute_target_grid(boundary, target_crs, resolution)
@@ -1843,13 +1946,13 @@ def main(province, resolution, contour_interval, output_dir,
 
     # ── Step 6c: Socioeconomic statistics ──
     socio_stats = step_socioeconomic(
-        boundary, internal_boundaries, pop_path, lc_path,
+        boundary, internal_boundaries, gso_pop, lc_path,
         terrain_paths, osm_paths, target_crs, output_dir)
 
     # ── Step 9: Maps (including population + socioeconomic) ──
     step_maps(output_dir, boundary, target_crs, all_rasters, osm_paths,
               dist_paths, contour_path,
-              pop_path=pop_path,
+              gso_pop=gso_pop,
               internal_boundaries=internal_boundaries,
               socio_stats=socio_stats)
 
