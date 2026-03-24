@@ -759,31 +759,24 @@ def step_terrain(dem_path: Path, output_dir: Path,
     log.info("  Computing slope & aspect...")
     slope, aspect = _slope_aspect(dem_data, cs)
 
-    log.info("  Computing curvature...")
-    curvature = _curvature(dem_data, cs)
+    log.info("  Computing hillshade...")
+    dem_valid = dem_data.copy()
+    dem_valid[np.isnan(dem_valid)] = 0
+    hillshade = _compute_hillshade(dem_valid, cs).astype(np.float32)
+    hillshade[nodata_mask] = -9999
 
-    flow_acc = _flow_accumulation(dem_data)
-
-    log.info("  Computing TWI...")
-    a = flow_acc * cs
-    slope_rad = np.radians(np.maximum(slope, 0.001))
-    twi = np.log(a / np.tan(slope_rad)).astype(np.float32)
-    twi = np.clip(twi, -5, 30)
-
-    # Apply nodata mask
-    for arr in [dem_utm, slope, aspect, curvature, flow_acc, twi]:
+    for arr in [dem_utm, slope, aspect]:
         arr[nodata_mask] = -9999
 
-    # Save native-resolution rasters
     native = output_dir / "native"
     native.mkdir(exist_ok=True)
     results = {}
-    for name, data in [('dem', dem_utm), ('slope', slope), ('aspect', aspect),
-                       ('curvature', curvature), ('flow_accumulation', flow_acc), ('twi', twi)]:
+    for name, data in [('hillshade', hillshade), ('dem', dem_utm),
+                       ('slope', slope), ('aspect', aspect)]:
         p = native / f"{name}.tif"
         write_raster(data, p, target_crs, tf)
         results[name] = p
-        log.info(f"  ✅ {name}: {p}")
+        log.info(f"  {name}: {p}")
 
     return results
 
@@ -2060,25 +2053,28 @@ def step_stack(raster_paths: dict, dist_paths: dict, output_dir: Path, grid: dic
 # ════════════════════════════════════════════════════════
 #  MAIN CLI
 # ════════════════════════════════════════════════════════
-def _run_single_province(province: str, resolution: float, contour_interval: float,
+def _run_single_province(province: str, contour_interval: float,
                          output_dir: Path, legacy_boundaries: bool,
                          osm_source: str, refresh_vn_data: bool):
-    """Run full pipeline for one province."""
-    log.info("[*] PROVINCIAL GIS PIPELINE (Vietnam)")
+    """Run pipeline for one province — generates only what the web map needs."""
+    log.info("[*] VIETNAM GIS PIPELINE")
     log.info(f"   Province:   {province}")
-    log.info(f"   Resolution: {resolution}m")
-    log.info(f"   Boundaries: {'Legacy (63 provinces)' if legacy_boundaries else '2025 Merger (34 units)'}")
     log.info("")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     log.info(f"   Output: {output_dir.resolve()}")
     log.info("")
 
-    # ── Step 1: Boundary (with merger support) ──
+    # Clear cached tiles so the web app re-renders with fresh data.
+    tiles_dir = output_dir / "tiles"
+    if tiles_dir.exists():
+        shutil.rmtree(tiles_dir, ignore_errors=True)
+        log.info("  🗑 Cleared tile cache")
+
+    # ── Step 1: Boundary ──
     boundary, internal_boundaries = step_boundary(
         province, output_dir, legacy=legacy_boundaries)
 
-    # Determine UTM CRS
     centroid = boundary.to_crs("EPSG:4326").geometry.centroid.iloc[0]
     target_crs = f"EPSG:{get_utm_epsg(centroid.x, centroid.y)}"
     log.info(f"  Target CRS: {target_crs}")
@@ -2086,126 +2082,83 @@ def _run_single_province(province: str, resolution: float, contour_interval: flo
     # ── Step 2: DEM ──
     dem_path = step_dem(boundary, output_dir)
 
-    # ── Step 3: Terrain ──
+    # ── Step 3: Terrain (hillshade, slope, aspect) ──
     terrain_paths = step_terrain(dem_path, output_dir, boundary, target_crs)
 
-    # ── Step 4: Contour ──
-    contour_path = step_contour(terrain_paths['dem'], output_dir, contour_interval)
+    # ── Step 4: Contour lines ──
+    step_contour(terrain_paths['dem'], output_dir, contour_interval)
 
-    # ── Step 5: OSM ──
+    # ── Step 5: OSM infrastructure ──
     osm_paths = step_osm(boundary, output_dir, source=osm_source,
                          refresh_vn_data=refresh_vn_data)
 
-    # ── Step 6a: WorldCover ──
+    # ── Step 6: Land cover ──
     lc_path = step_landcover(boundary, output_dir)
 
-    # ── Step 6b: Population (GSO) ──
+    # ── Step 7: Population (GSO) ──
     gso_pop = step_population(boundary, internal_boundaries, output_dir)
 
-    # ── Target grid ──
-    grid = compute_target_grid(boundary, target_crs, resolution)
-    log.info(f"\n  Target grid: {grid['width']}x{grid['height']} @ {resolution}m")
-
-    # ── Step 7: Distance rasters ──
-    dist_paths = step_distance(osm_paths, grid, boundary, output_dir)
-
-    # ── Step 8: Normalize ──
-    all_rasters = step_normalize(terrain_paths, lc_path, grid, boundary, output_dir)
-
-    # ── Step 6c: Socioeconomic statistics ──
+    # ── Step 8: Socioeconomic statistics ──
     socio_stats = step_socioeconomic(
         boundary, internal_boundaries, gso_pop, lc_path,
         terrain_paths, osm_paths, target_crs, output_dir)
 
-    # ── Step 9: Maps (including population + socioeconomic) ──
-    step_maps(output_dir, boundary, target_crs, all_rasters, osm_paths,
-              dist_paths, contour_path,
-              gso_pop=gso_pop,
-              internal_boundaries=internal_boundaries,
-              socio_stats=socio_stats)
-
-    # ── Step 10: Stack ──
-    step_stack(all_rasters, dist_paths, output_dir, grid)
-
     # ── Summary ──
     log.info("")
     log.info("═" * 60)
-    log.info("🎉 PIPELINE COMPLETE!")
+    log.info("PIPELINE COMPLETE!")
     log.info("═" * 60)
     prov_name = boundary.iloc[0].get('NAME_1', province)
     log.info(f"  Province: {prov_name}")
     if internal_boundaries is not None:
         old_names = internal_boundaries['NAME_1'].tolist()
         log.info(f"  Merged from: {', '.join(old_names)}")
-    log.info(f"  Output directory: {output_dir.resolve()}")
+    log.info(f"  Output: {output_dir.resolve()}")
 
     if socio_stats:
-        log.info("")
-        log.info("  📊 Key Statistics:")
         if 'area_km2' in socio_stats:
-            log.info(f"     Area:        {socio_stats['area_km2']:>10,.0f} km²")
+            log.info(f"  Area:       {socio_stats['area_km2']:>10,.0f} km²")
         if 'population' in socio_stats:
-            log.info(f"     Population:  {socio_stats['population']:>10,.0f}")
-            log.info(f"     Density:     {socio_stats['population_density_per_km2']:>10,.0f} /km²")
+            log.info(f"  Population: {socio_stats['population']:>10,.0f}")
         if 'urban_percent' in socio_stats:
-            log.info(f"     Urban:       {socio_stats['urban_percent']:>10.1f}%")
-        if 'forest_percent' in socio_stats:
-            log.info(f"     Forest:      {socio_stats['forest_percent']:>10.1f}%")
-
-    log.info("")
-    log.info("  📁 Files generated:")
-    for f in sorted(output_dir.rglob("*")):
-        if f.is_file() and 'raw' not in str(f) and 'native' not in str(f):
-            size = f.stat().st_size / (1024 * 1024)
-            log.info(f"     {f.relative_to(output_dir)}  ({size:.1f} MB)")
+            log.info(f"  Urban:      {socio_stats['urban_percent']:>10.1f}%")
 
 
 @click.command()
-@click.option('--province', default="", help='Province name (optional). Leave empty to run all Vietnam')
-@click.option('--resolution', default=5.0, type=float, help='Target resolution (m)')
-@click.option('--contour-interval', default=10.0, type=float, help='Contour interval (m)')
-@click.option('--output-dir', default=None, type=str, help='Output directory')
-@click.option('--legacy-boundaries', is_flag=True, default=False,
-              help='Use old 63-province boundaries (skip 2025 merger)')
+@click.option('--province', default="", help='Province name. Leave empty to run all Vietnam.')
 @click.option('--list-provinces', is_flag=True, default=False,
               help='List all available province names and exit')
+@click.option('--contour-interval', default=10.0, type=float, hidden=True)
+@click.option('--output-dir', default=None, type=str, hidden=True)
+@click.option('--legacy-boundaries', is_flag=True, default=False, hidden=True)
 @click.option('--osm-source', type=click.Choice(['auto', 'geofabrik', 'overpass']),
-              default='geofabrik', show_default=True,
-              help='Infrastructure source for Vietnam OSM layers')
-@click.option('--refresh-vn-data', is_flag=True, default=False,
-              hidden=True,
-              help='Force refresh Vietnam source datasets (Geofabrik/GADM/ODMekong)')
-@click.option('--crawl-vn-data-only', is_flag=True, default=False,
-              hidden=True,
-              help='Only crawl/update Vietnam datasets then exit')
-def main(province, resolution, contour_interval, output_dir,
-         legacy_boundaries, list_provinces, osm_source,
-         refresh_vn_data, crawl_vn_data_only):
+              default='geofabrik', hidden=True)
+@click.option('--refresh-vn-data', is_flag=True, default=False, hidden=True)
+@click.option('--crawl-vn-data-only', is_flag=True, default=False, hidden=True)
+def main(province, list_provinces, contour_interval, output_dir,
+         legacy_boundaries, osm_source, refresh_vn_data, crawl_vn_data_only):
     """
-    Provincial GIS Pipeline (Vietnam).
+    Vietnam GIS Pipeline.
 
-    Country-first GIS Pipeline (Vietnam).
-
-    By default (no --province), runs all 34 provinces in the 2025 structure.
-    You can still run a single province with --province.
+    \b
+    Generates map data for the web viewer.
+    By default runs all 34 provinces. Use --province to run one.
 
     \b
     Examples:
-        python pipeline.py                               # Whole Vietnam (34 provinces)
-        python pipeline.py --province "Hồ Chí Minh"     # One province
+        python pipeline.py                             # All Vietnam
+        python pipeline.py --province "Hồ Chí Minh"   # One province
         python pipeline.py --list-provinces
     """
     if list_provinces:
         log.info("═" * 60)
-        log.info("  AVAILABLE PROVINCES")
+        log.info("  AVAILABLE PROVINCES (34 units, NQ 202/2025/QH15)")
         log.info("═" * 60)
-        log.info("\n  ── 2025 Provinces (34 units, NQ 202/2025/QH15) ──")
         for new_name, old_names in sorted(PROVINCE_MERGER_2025.items()):
             if len(old_names) > 1:
-                log.info(f"    {new_name:<16} ← {', '.join(old_names)}")
+                log.info(f"  {new_name:<16} <- {', '.join(old_names)}")
             else:
-                log.info(f"    {new_name:<16}   (unchanged)")
-        log.info(f"\n  Use --legacy-boundaries to access old 63-province GADM names.")
+                log.info(f"  {new_name:<16}   (unchanged)")
         return
 
     if crawl_vn_data_only:
@@ -2215,55 +2168,38 @@ def main(province, resolution, contour_interval, output_dir,
     province = (province or "").strip()
     if province:
         safe_name = province.replace(" ", "_").replace(".", "")
-        if output_dir is None:
-            out_dir = Path("data") / "province" / safe_name
-        else:
-            out_dir = Path(output_dir)
-        _run_single_province(
-            province, resolution, contour_interval, out_dir,
-            legacy_boundaries, osm_source, refresh_vn_data)
+        out_dir = Path(output_dir) if output_dir else Path("data") / "province" / safe_name
+        _run_single_province(province, contour_interval, out_dir,
+                             legacy_boundaries, osm_source, refresh_vn_data)
         return
 
-    # Default mode: run all 34 provinces for whole Vietnam.
-    if output_dir is None:
-        base_out = Path("data") / "province"
-    else:
-        base_out = Path(output_dir)
+    base_out = Path(output_dir) if output_dir else Path("data") / "province"
     base_out.mkdir(parents=True, exist_ok=True)
 
     provinces = sorted(PROVINCE_MERGER_2025.keys())
     log.info("═" * 60)
-    log.info("🇻🇳 WHOLE VIETNAM MODE")
+    log.info(f"  WHOLE VIETNAM — {len(provinces)} provinces")
     log.info("═" * 60)
-    log.info(f"  Provinces to run: {len(provinces)}")
-    log.info(f"  Output base dir:  {base_out.resolve()}")
-    log.info(f"  OSM source:       {osm_source}")
-    log.info("")
 
     failed = []
     for i, p in enumerate(provinces, 1):
         safe_name = p.replace(" ", "_").replace(".", "")
         out_dir = base_out / safe_name
-        log.info("─" * 60)
-        log.info(f"[{i}/{len(provinces)}] {p}")
-        log.info("─" * 60)
+        log.info(f"\n[{i}/{len(provinces)}] {p}")
         try:
-            _run_single_province(
-                p, resolution, contour_interval, out_dir,
-                legacy_boundaries, osm_source, refresh_vn_data)
+            _run_single_province(p, contour_interval, out_dir,
+                                 legacy_boundaries, osm_source, refresh_vn_data)
         except Exception as e:
-            log.error(f"❌ Failed: {p}: {e}")
+            log.error(f"Failed: {p}: {e}")
             failed.append((p, str(e)))
 
     log.info("")
-    log.info("═" * 60)
     if failed:
-        log.warning(f"⚠ Completed with failures: {len(failed)}/{len(provinces)}")
+        log.warning(f"Completed with {len(failed)} failures:")
         for p, err in failed:
             log.warning(f"  - {p}: {err}")
     else:
-        log.info(f"✅ Completed all provinces: {len(provinces)}/{len(provinces)}")
-    log.info("═" * 60)
+        log.info(f"All {len(provinces)} provinces done.")
 
 
 if __name__ == '__main__':

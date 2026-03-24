@@ -3,20 +3,36 @@ import maplibregl from 'maplibre-gl'
 import './App.css'
 
 const RASTER_LAYERS = [
-  { id: 'dem', label: 'DEM', group: 'Terrain' },
+  { id: 'hillshade', label: 'Hillshade', group: 'Terrain' },
+  { id: 'dem', label: 'Elevation', group: 'Terrain' },
   { id: 'slope', label: 'Slope', group: 'Terrain' },
   { id: 'aspect', label: 'Aspect', group: 'Terrain' },
-  { id: 'curvature', label: 'Curvature', group: 'Terrain' },
-  { id: 'flow_accumulation', label: 'Flow Accumulation', group: 'Terrain' },
-  { id: 'twi', label: 'TWI', group: 'Terrain' },
   { id: 'landcover', label: 'Land Cover', group: 'Landcover' },
-  { id: 'dist_road', label: 'Distance to Road', group: 'Distance' },
-  { id: 'dist_river', label: 'Distance to River', group: 'Distance' },
 ]
 
+const RASTER_LEGENDS = {
+  hillshade: { title: 'Hillshade', items: [
+    { color: '#222', label: 'Shadow' }, { color: '#888', label: 'Flat' }, { color: '#eee', label: 'Sunlit' },
+  ]},
+  dem: { title: 'Elevation (m)', items: [
+    { color: '#234f1e', label: 'Low' }, { color: '#8cbc70', label: '' },
+    { color: '#f5deb3', label: '' }, { color: '#a0522d', label: '' }, { color: '#fff', label: 'High' },
+  ]},
+  slope: { title: 'Slope (degrees)', items: [
+    { color: '#ffffb2', label: '0' }, { color: '#fd8d3c', label: '15' }, { color: '#bd0026', label: '45+' },
+  ]},
+  aspect: { title: 'Aspect (direction)', items: [
+    { color: '#f00', label: 'N' }, { color: '#ff0', label: 'E' },
+    { color: '#0f0', label: 'S' }, { color: '#00f', label: 'W' }, { color: '#f00', label: 'N' },
+  ]},
+  landcover: { title: 'Land Cover', items: [
+    { color: '#006400', label: 'Forest' }, { color: '#F096FF', label: 'Cropland' },
+    { color: '#FA0000', label: 'Urban' }, { color: '#0064C8', label: 'Water' },
+    { color: '#FFBB22', label: 'Shrub' }, { color: '#B4B4B4', label: 'Bare' },
+  ]},
+}
+
 const VECTOR_LAYERS = [
-  { id: 'roads', label: 'Roads', type: 'line', color: '#d62828' },
-  { id: 'rivers', label: 'Rivers', type: 'line', color: '#1565c0' },
   { id: 'infrastructure', label: 'Infrastructure', type: 'circle', color: '#ff8f00' },
   { id: 'contour', label: 'Contours', type: 'line', color: '#7b5d2a' },
 ]
@@ -322,6 +338,12 @@ export default function App() {
     if (activeRaster === layerId) {
       if (map.getLayer('active-raster-layer')) map.removeLayer('active-raster-layer')
       if (map.getSource('active-raster-source')) map.removeSource('active-raster-source')
+      if (map.getLayer('province-fill')) {
+        map.setPaintProperty('province-fill', 'fill-opacity', 0.30)
+      }
+      if (map.getLayer('province-selected-fill')) {
+        map.setPaintProperty('province-selected-fill', 'fill-opacity', 0.12)
+      }
       setActiveRaster('')
       return
     }
@@ -340,6 +362,12 @@ export default function App() {
       source: 'active-raster-source',
       paint: { 'raster-opacity': 0.84 },
     })
+    if (map.getLayer('province-fill')) {
+      map.setPaintProperty('province-fill', 'fill-opacity', 0.12)
+    }
+    if (map.getLayer('province-selected-fill')) {
+      map.setPaintProperty('province-selected-fill', 'fill-opacity', 0.06)
+    }
     setActiveRaster(layerId)
   }
 
@@ -360,24 +388,33 @@ export default function App() {
     if (!cfg) return
 
     try {
-      const geo = await fetch(`/api/provinces/${encodeURIComponent(selectedProvince)}/vector/${layerId}`).then((r) => r.json())
+      const vectorParams = {
+        infrastructure: 'simplify=0.001&max_features=8000',
+        contour: 'simplify=0.0012&max_features=12000',
+      }
+      const q = vectorParams[layerId] || 'simplify=0.0015&max_features=10000'
+      const geo = await fetch(
+        `/api/provinces/${encodeURIComponent(selectedProvince)}/vector/${layerId}?${q}`
+      ).then((r) => r.json())
       map.addSource(sourceId, { type: 'geojson', data: geo })
       if (cfg.type === 'line') {
         map.addLayer({
           id: layerMapId,
           type: 'line',
           source: sourceId,
-          paint: { 'line-color': cfg.color, 'line-width': 1.3, 'line-opacity': 0.95 },
+          minzoom: 8,
+          paint: { 'line-color': cfg.color, 'line-width': 1.1, 'line-opacity': 0.9 },
         })
       } else {
         map.addLayer({
           id: layerMapId,
           type: 'circle',
           source: sourceId,
+          minzoom: 10,
           paint: {
             'circle-color': cfg.color,
-            'circle-radius': 2.5,
-            'circle-opacity': 0.8,
+            'circle-radius': 2,
+            'circle-opacity': 0.75,
             'circle-stroke-width': 0,
           },
         })
@@ -407,7 +444,7 @@ export default function App() {
       <header className="topbar">
         <div>
           <h1 className="top-title">Vietnam GIS Explorer</h1>
-          <p className="top-sub">NQ 202/2025 ? Terrain ? OSM ? GSO</p>
+          {/* <p className="top-sub">NQ 202/2025 ? Terrain ? OSM ? GSO</p> */}
         </div>
         <div className="toolbar">
           <select
@@ -478,12 +515,26 @@ export default function App() {
       <main ref={mapNode} className="map-wrap" />
 
       <div className="legend-overlay glass">
-        <b>Density / km?</b>
-        <div className="legend-row"><span style={{ background: '#dcfce7' }} /> 50</div>
-        <div className="legend-row"><span style={{ background: '#86efac' }} /> 300</div>
-        <div className="legend-row"><span style={{ background: '#fbbf24' }} /> 800</div>
-        <div className="legend-row"><span style={{ background: '#fb7185' }} /> 1,600</div>
-        <div className="legend-row"><span style={{ background: '#e11d48' }} /> 2,600+</div>
+        {activeRaster && RASTER_LEGENDS[activeRaster] ? (
+          <>
+            <b>{RASTER_LEGENDS[activeRaster].title}</b>
+            {RASTER_LEGENDS[activeRaster].items.map((it, i) => (
+              <div key={i} className="legend-row">
+                <span style={{ background: it.color }} />
+                {it.label}
+              </div>
+            ))}
+          </>
+        ) : (
+          <>
+            <b>Density / km&sup2;</b>
+            <div className="legend-row"><span style={{ background: '#dcfce7' }} /> 50</div>
+            <div className="legend-row"><span style={{ background: '#86efac' }} /> 300</div>
+            <div className="legend-row"><span style={{ background: '#fbbf24' }} /> 800</div>
+            <div className="legend-row"><span style={{ background: '#fb7185' }} /> 1,600</div>
+            <div className="legend-row"><span style={{ background: '#e11d48' }} /> 2,600+</div>
+          </>
+        )}
       </div>
 
       <aside className="right-panel glass">
@@ -493,8 +544,8 @@ export default function App() {
         {stats && !loadingProvince && (
           <div className="stats">
             <div className="card"><span>Population</span><b>{number(stats.population)}</b></div>
-            <div className="card"><span>Area</span><b>{number(stats.area_km2)} km?</b></div>
-            <div className="card"><span>Density</span><b>{number(stats.density_per_km2)}/km?</b></div>
+            <div className="card"><span>Area</span><b>{number(stats.area_km2)} km&sup2;</b></div>
+            <div className="card"><span>Density</span><b>{number(stats.density_per_km2)}/km&sup2;</b></div>
             {stats.socioeconomic?.urban_percent != null && (
               <div className="card"><span>Urban</span><b>{stats.socioeconomic.urban_percent.toFixed(1)}%</b></div>
             )}

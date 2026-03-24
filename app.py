@@ -33,9 +33,13 @@ from pipeline import (
     LANDCOVER_CLASSES, _normalize_vn, download_file,
 )
 
+from pyproj import Transformer
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.cm as mpl_cm
+
+_TO_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
 
 # ── Paths ──────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
@@ -47,15 +51,14 @@ FRONTEND_ASSETS_DIR = FRONTEND_DIST_DIR / "assets"
 
 # ── Layer rendering config ─────────────────────────────
 LAYER_CONFIG: Dict[str, dict] = {
-    "dem":               {"cmap": "gist_earth",  "vmin": 0,    "vmax": 2500},
-    "slope":             {"cmap": "YlOrRd",      "vmin": 0,    "vmax": 45},
-    "aspect":            {"cmap": "twilight",     "vmin": 0,    "vmax": 360},
-    "curvature":         {"cmap": "RdBu_r",       "vmin": -1,   "vmax": 1},
-    "flow_accumulation": {"cmap": "Blues",        "vmin": 0,    "vmax": 500},
-    "twi":               {"cmap": "YlGnBu",      "vmin": 0,    "vmax": 20},
-    "dist_road":         {"cmap": "YlOrRd_r",    "vmin": 0,    "vmax": 10000},
-    "dist_river":        {"cmap": "YlOrRd_r",    "vmin": 0,    "vmax": 10000},
+    "hillshade":  {"cmap": "gray",        "vmin": 0,    "vmax": 255},
+    "dem":        {"cmap": "gist_earth",   "vmin": 0,    "vmax": 2500},
+    "slope":      {"cmap": "YlOrRd",       "vmin": 0,    "vmax": 45},
+    "aspect":     {"cmap": "hsv",          "vmin": 0,    "vmax": 360},
 }
+
+# Per-province auto-scale cache: {(province_safe, layer): (vmin, vmax)}
+_stats_cache: Dict[tuple, tuple] = {}
 
 # ── Transparent 256x256 tile (lazy) ────────────────────
 _EMPTY_PNG: Optional[bytes] = None
@@ -196,9 +199,53 @@ def _build_merged_boundaries():
     _boundaries_cache = {"type": "FeatureCollection", "features": features}
     return _boundaries_cache
 
+# ── Auto-scale: percentile-based vmin/vmax ─────────────
+
+def _get_layer_range(pdir: Path, layer: str) -> tuple:
+    """Return (vmin, vmax) for a raster layer, using cached percentile stats."""
+    safe_name = pdir.name
+    key = (safe_name, layer)
+    if key in _stats_cache:
+        return _stats_cache[key]
+
+    cfg = LAYER_CONFIG.get(layer)
+    if cfg:
+        fallback = (cfg["vmin"], cfg["vmax"])
+    else:
+        fallback = (0, 1)
+
+    tif = pdir / f"{layer}.tif"
+    if not tif.exists():
+        tif = pdir / "native" / f"{layer}.tif"
+    if not tif.exists():
+        _stats_cache[key] = fallback
+        return fallback
+
+    try:
+        with rasterio.open(tif) as src:
+            data = src.read(1).astype(float)
+            nd = src.nodata
+        if nd is not None:
+            data[data == nd] = np.nan
+        valid = data[~np.isnan(data)]
+        if len(valid) == 0:
+            _stats_cache[key] = fallback
+            return fallback
+        vmin = float(np.percentile(valid, 2))
+        vmax = float(np.percentile(valid, 98))
+        if vmax - vmin < 1e-6:
+            vmin, vmax = fallback
+        _stats_cache[key] = (vmin, vmax)
+        return (vmin, vmax)
+    except Exception:
+        _stats_cache[key] = fallback
+        return fallback
+
+
 # ── Tile renderer ──────────────────────────────────────
 
-def _render_tile(data: np.ndarray, mask: np.ndarray, layer: str) -> bytes:
+def _render_tile(data: np.ndarray, mask: np.ndarray, layer: str,
+                 vmin: float = 0, vmax: float = 1) -> bytes:
     """Colorize a single-band tile array → RGBA PNG bytes."""
     h, w = data.shape
 
@@ -211,9 +258,8 @@ def _render_tile(data: np.ndarray, mask: np.ndarray, layer: str) -> bytes:
             rgba[data == cls_id] = [r, g, b, 200]
         rgba[mask == 0, 3] = 0
     else:
-        cfg = LAYER_CONFIG.get(layer, {"cmap": "viridis", "vmin": 0, "vmax": 1})
+        cfg = LAYER_CONFIG.get(layer, {"cmap": "viridis"})
         cmap = mpl_cm.get_cmap(cfg["cmap"])
-        vmin, vmax = cfg["vmin"], cfg["vmax"]
         normed = np.clip((data.astype(float) - vmin) / max(vmax - vmin, 1e-6), 0, 1)
         rgba = (cmap(normed) * 255).astype(np.uint8)
         rgba[..., 3] = np.where(mask > 0, 200, 0)
@@ -282,8 +328,7 @@ async def province_layers(name: str):
         return {"raster": [], "vector": []}
 
     rasters = []
-    for lyr in ["dem", "slope", "aspect", "curvature", "flow_accumulation",
-                 "twi", "landcover", "dist_road", "dist_river"]:
+    for lyr in ["hillshade", "dem", "slope", "aspect", "landcover"]:
         for sub in ["", "native"]:
             p = pdir / sub / f"{lyr}.tif" if sub else pdir / f"{lyr}.tif"
             if p.exists():
@@ -291,8 +336,7 @@ async def province_layers(name: str):
                 break
 
     vectors = []
-    for lyr, ext in [("roads", ".gpkg"), ("rivers", ".gpkg"),
-                      ("infrastructure", ".gpkg"), ("contour", ".shp")]:
+    for lyr, ext in [("infrastructure", ".gpkg"), ("contour", ".shp")]:
         if (pdir / f"{lyr}{ext}").exists():
             vectors.append(lyr)
 
@@ -321,7 +365,8 @@ async def province_stats(name: str):
 
 @app.get("/api/provinces/{name}/vector/{layer}")
 async def province_vector(name: str, layer: str,
-                          simplify: float = Query(0.0005)):
+                          simplify: float = Query(0.0015),
+                          max_features: int = Query(20000, ge=500, le=100000)):
     matched = _resolve(name)
     if not matched:
         raise HTTPException(404)
@@ -341,6 +386,13 @@ async def province_vector(name: str, layer: str,
         gdf = gdf.to_crs("EPSG:4326")
     if simplify > 0:
         gdf["geometry"] = gdf.geometry.simplify(simplify)
+    gdf = gdf[gdf.geometry.notnull()].copy()
+
+    # Large province-wide OSM layers can freeze the browser if sent raw.
+    if len(gdf) > max_features:
+        stride = max(1, int(math.ceil(len(gdf) / max_features)))
+        gdf = gdf.iloc[::stride].copy()
+
     return JSONResponse(json.loads(gdf.to_json()))
 
 
@@ -354,10 +406,8 @@ def _tile_bounds(z: int, x: int, y: int):
         return math.degrees(lat_rad)
     west, east = _lng(x), _lng(x + 1)
     north, south = _lat(y), _lat(y + 1)
-    from pyproj import Transformer
-    to_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
-    mx0, my0 = to_3857.transform(west, south)
-    mx1, my1 = to_3857.transform(east, north)
+    mx0, my0 = _TO_3857.transform(west, south)
+    mx1, my1 = _TO_3857.transform(east, north)
     return mx0, my0, mx1, my1
 
 
@@ -368,6 +418,13 @@ async def tile(name: str, layer: str, z: int, x: int, y: int):
         raise HTTPException(404)
 
     pdir = _pdir(matched)
+
+    # Disk cache: serve pre-rendered tile if available
+    cache_path = pdir / "tiles" / layer / str(z) / str(x) / f"{y}.png"
+    if cache_path.exists():
+        return FileResponse(cache_path, media_type="image/png",
+                            headers={"Cache-Control": "public, max-age=86400"})
+
     tif = pdir / f"{layer}.tif"
     if not tif.exists():
         tif = pdir / "native" / f"{layer}.tif"
@@ -385,7 +442,7 @@ async def tile(name: str, layer: str, z: int, x: int, y: int):
                     tb[3] < src_bounds_3857[1] or tb[1] > src_bounds_3857[3]):
                 return Response(content=_empty_tile(), media_type="image/png")
 
-            is_categorical = layer == "landcover"
+            is_categorical = layer in ("landcover",)
             resamp = Resampling.nearest if is_categorical else Resampling.bilinear
             nodata = src.nodata
             dtype = src.dtypes[0]
@@ -407,9 +464,19 @@ async def tile(name: str, layer: str, z: int, x: int, y: int):
             mask[dst_data == nodata] = 0
         mask[np.isnan(dst_data.astype(float))] = 0
 
-        content = _render_tile(dst_data.astype(float), mask, layer)
+        vmin, vmax = _get_layer_range(pdir, layer)
+        content = _render_tile(dst_data.astype(float), mask, layer,
+                               vmin=vmin, vmax=vmax)
+
+        # Write to disk cache for future requests
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_bytes(content)
+        except Exception:
+            pass
+
         return Response(content=content, media_type="image/png",
-                        headers={"Cache-Control": "public, max-age=3600"})
+                        headers={"Cache-Control": "public, max-age=86400"})
     except Exception:
         return Response(content=_empty_tile(), media_type="image/png")
 
