@@ -841,14 +841,23 @@ def step_landcover(boundary: gpd.GeoDataFrame, output_dir: Path) -> Optional[Pat
 # ════════════════════════════════════════════════════════
 def _lookup_gso_population(province_names: List[str]) -> List[Dict]:
     """Return per-province GSO stats for the given GADM NAME_1 list."""
+    # Build a normalized lookup to handle input variants such as:
+    # "BìnhDương", "BàRịa-VũngTàu", "HồChíMinh", etc.
+    norm_gso = {_normalize_vn(k): (k, v) for k, v in GSO_PROVINCE_DATA.items()}
     results = []
     for name in province_names:
         entry = GSO_PROVINCE_DATA.get(name)
+        used_name = name
+        if entry is None:
+            norm = _normalize_vn(name)
+            hit = norm_gso.get(norm)
+            if hit is not None:
+                used_name, entry = hit
         if entry:
             pop = entry['population']
             area = entry['area_km2']
             results.append({
-                'name': name,
+                'name': used_name,
                 'population': pop,
                 'area_km2': area,
                 'density_per_km2': round(pop / area, 1) if area > 0 else 0,
