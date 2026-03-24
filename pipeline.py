@@ -28,6 +28,9 @@ import os
 import sys
 import io
 import math
+import shutil
+import zipfile
+from email.utils import parsedate_to_datetime
 
 # Fix Windows terminal encoding + disable buffering
 os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
@@ -81,6 +84,8 @@ OD_MEKONG_BOUNDARY_URL = (
 )
 COP_DEM_BASE = "https://copernicus-dem-30m.s3.amazonaws.com"
 ESA_WC_BASE = "https://esa-worldcover.s3.eu-central-1.amazonaws.com/v200/2021/map"
+GEOFABRIK_VN_SHP_URL = "https://download.geofabrik.de/asia/vietnam-latest-free.shp.zip"
+GEOFABRIK_VN_PBF_URL = "https://download.geofabrik.de/asia/vietnam-latest.osm.pbf"
 
 LANDCOVER_CLASSES = {
     10: ("Tree cover", "Forest", "#006400"),
@@ -309,6 +314,108 @@ def download_file(url: str, dest: Path, desc: str = "", retries: int = 3) -> boo
             if attempt < retries - 1:
                 time.sleep(2 ** attempt)
     return False
+
+
+def _remote_last_modified_epoch(url: str) -> Optional[float]:
+    """Return HTTP Last-Modified as epoch seconds, or None."""
+    try:
+        r = requests.head(url, timeout=(10, 20), allow_redirects=True)
+        r.raise_for_status()
+        lm = r.headers.get("last-modified")
+        if not lm:
+            return None
+        return parsedate_to_datetime(lm).timestamp()
+    except Exception:
+        return None
+
+
+def _download_if_newer(url: str, dest: Path, desc: str) -> bool:
+    """Download only when remote appears newer than local file."""
+    remote_ts = _remote_last_modified_epoch(url)
+    if dest.exists() and remote_ts is not None:
+        # 1-minute tolerance for filesystem/network clock differences
+        if dest.stat().st_mtime >= (remote_ts - 60):
+            log.info(f"  ✅ Up-to-date: {desc}")
+            return True
+    return download_file(url, dest, desc)
+
+
+def _extract_zip_if_changed(zip_path: Path, extract_dir: Path) -> bool:
+    """Extract zip only when content changed since last extraction."""
+    marker = extract_dir / ".extracted_from_mtime"
+    zip_mtime = str(int(zip_path.stat().st_mtime))
+    if extract_dir.exists() and marker.exists():
+        if marker.read_text(encoding="utf-8").strip() == zip_mtime:
+            log.info("  ✅ Geofabrik archive already extracted")
+            return True
+
+    if extract_dir.exists():
+        shutil.rmtree(extract_dir, ignore_errors=True)
+    extract_dir.mkdir(parents=True, exist_ok=True)
+
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(extract_dir)
+    marker.write_text(zip_mtime, encoding="utf-8")
+    log.info(f"  ✅ Extracted: {extract_dir}")
+    return True
+
+
+def crawl_vietnam_data(force_refresh: bool = False) -> Dict[str, Optional[Path]]:
+    """Crawl/update Vietnam-only source datasets used by the pipeline."""
+    log.info("═" * 60)
+    log.info("🛰️  CRAWL: Vietnam-only updated data sources")
+    log.info("═" * 60)
+
+    out = {}
+    base = Path("data") / "sources" / "vietnam"
+    boundary_dir = base / "boundary"
+    osm_dir = base / "osm"
+    boundary_dir.mkdir(parents=True, exist_ok=True)
+    osm_dir.mkdir(parents=True, exist_ok=True)
+
+    gadm_path = boundary_dir / "gadm41_VNM_1.json"
+    od_path = boundary_dir / "od_mekong_provinces.geojson"
+    shp_zip = osm_dir / "vietnam-latest-free.shp.zip"
+    pbf_path = osm_dir / "vietnam-latest.osm.pbf"
+    shp_extract = osm_dir / "vietnam-latest-free-shp"
+
+    # Boundaries (Vietnam only)
+    if force_refresh:
+        download_file(GADM_URL, gadm_path, "GADM Vietnam")
+        download_file(OD_MEKONG_BOUNDARY_URL, od_path, "OD Mekong Vietnam provinces")
+    else:
+        _download_if_newer(GADM_URL, gadm_path, "GADM Vietnam")
+        _download_if_newer(OD_MEKONG_BOUNDARY_URL, od_path, "OD Mekong Vietnam provinces")
+
+    # OSM Vietnam (daily Geofabrik)
+    if force_refresh:
+        ok_shp = download_file(GEOFABRIK_VN_SHP_URL, shp_zip, "Geofabrik Vietnam shapefiles")
+    else:
+        ok_shp = _download_if_newer(GEOFABRIK_VN_SHP_URL, shp_zip, "Geofabrik Vietnam shapefiles")
+    if ok_shp and shp_zip.exists():
+        _extract_zip_if_changed(shp_zip, shp_extract)
+
+    # Keep latest PBF too (optional for downstream tooling)
+    if force_refresh:
+        download_file(GEOFABRIK_VN_PBF_URL, pbf_path, "Geofabrik Vietnam PBF")
+    else:
+        _download_if_newer(GEOFABRIK_VN_PBF_URL, pbf_path, "Geofabrik Vietnam PBF")
+
+    out["gadm"] = gadm_path if gadm_path.exists() else None
+    out["od_mekong"] = od_path if od_path.exists() else None
+    out["osm_shp_zip"] = shp_zip if shp_zip.exists() else None
+    out["osm_shp_dir"] = shp_extract if shp_extract.exists() else None
+    out["osm_pbf"] = pbf_path if pbf_path.exists() else None
+
+    log.info("  ✅ Crawl done")
+    for k, v in out.items():
+        if v is not None:
+            mb = v.stat().st_size / (1024 * 1024) if v.is_file() else 0
+            if v.is_file():
+                log.info(f"     {k:<12}: {v} ({mb:.1f} MB)")
+            else:
+                log.info(f"     {k:<12}: {v}")
+    return out
 
 
 def get_utm_epsg(lon: float, lat: float) -> int:
@@ -734,8 +841,8 @@ def step_contour(dem_native_path: Path, output_dir: Path, interval: float = 10.0
 # ════════════════════════════════════════════════════════
 #  STEP 5: OSM DATA
 # ════════════════════════════════════════════════════════
-def step_osm(boundary: gpd.GeoDataFrame, output_dir: Path) -> Dict[str, Optional[Path]]:
-    """Download roads, rivers, infrastructure from OSM."""
+def _step_osm_overpass(boundary: gpd.GeoDataFrame, output_dir: Path) -> Dict[str, Optional[Path]]:
+    """Download roads, rivers, infrastructure from OSM Overpass."""
     log.info("═" * 60)
     log.info("🛣️  STEP 5: OSM Data (Roads, Rivers, Infrastructure)")
     log.info("═" * 60)
@@ -772,6 +879,99 @@ def step_osm(boundary: gpd.GeoDataFrame, output_dir: Path) -> Dict[str, Optional
             results[name] = None
 
     return results
+
+
+def _step_osm_geofabrik(boundary: gpd.GeoDataFrame, output_dir: Path,
+                        refresh: bool = False) -> Dict[str, Optional[Path]]:
+    """Build OSM layers from Geofabrik Vietnam shapefile package."""
+    log.info("═" * 60)
+    log.info("🛣️  STEP 5: OSM Data (Geofabrik Vietnam daily extract)")
+    log.info("═" * 60)
+
+    local_shp_dir = Path("data") / "sources" / "vietnam" / "osm" / "vietnam-latest-free-shp"
+    if refresh or not local_shp_dir.exists():
+        crawled = crawl_vietnam_data(force_refresh=refresh)
+        shp_dir = crawled.get("osm_shp_dir")
+        if shp_dir is None:
+            log.error("  ❌ Geofabrik shapefile directory unavailable")
+            return {"roads": None, "rivers": None, "infrastructure": None}
+    else:
+        shp_dir = local_shp_dir
+        log.info(f"  ✅ Using local Geofabrik extract: {shp_dir}")
+
+    boundary_ll = boundary.to_crs("EPSG:4326")
+    polygon = boundary_ll.geometry.values[0]
+    minx, miny, maxx, maxy = boundary_ll.total_bounds
+    bbox = (minx, miny, maxx, maxy)
+
+    def _load_clip(shp_name: str) -> Optional[gpd.GeoDataFrame]:
+        shp = Path(shp_dir) / shp_name
+        if not shp.exists():
+            log.warning(f"  ⚠ Missing Geofabrik layer: {shp_name}")
+            return None
+        try:
+            gdf = gpd.read_file(shp, bbox=bbox)
+            if gdf.empty:
+                return gdf
+            if gdf.crs is None:
+                gdf = gdf.set_crs("EPSG:4326", allow_override=True)
+            elif str(gdf.crs) != "EPSG:4326":
+                gdf = gdf.to_crs("EPSG:4326")
+            gdf = gdf[gdf.geometry.notnull()].copy()
+            if gdf.empty:
+                return gdf
+            gdf = gdf[gdf.geometry.intersects(polygon)].copy()
+            return gdf
+        except Exception as e:
+            log.warning(f"  ⚠ Failed reading {shp_name}: {e}")
+            return None
+
+    results = {"roads": None, "rivers": None, "infrastructure": None}
+    layer_map = {
+        "roads": ["gis_osm_roads_free_1.shp"],
+        "rivers": ["gis_osm_waterways_free_1.shp"],
+        "infrastructure": ["gis_osm_pois_free_1.shp", "gis_osm_buildings_a_free_1.shp"],
+    }
+
+    keep_cols = ["geometry", "name", "highway", "waterway", "amenity", "building", "fclass"]
+    for layer_name, shp_list in layer_map.items():
+        frames = []
+        for shp in shp_list:
+            gdf = _load_clip(shp)
+            if gdf is not None and not gdf.empty:
+                cols = [c for c in keep_cols if c in gdf.columns]
+                if "geometry" not in cols:
+                    cols = ["geometry"] + cols
+                gdf = gdf[cols].copy()
+                frames.append(gdf)
+        if not frames:
+            log.warning(f"  ⚠ No {layer_name} found from Geofabrik package")
+            continue
+
+        merged = gpd.GeoDataFrame(pd.concat(frames, ignore_index=True), crs="EPSG:4326")
+        out = output_dir / f"{layer_name}.gpkg"
+        merged.to_file(out, driver="GPKG")
+        results[layer_name] = out
+        log.info(f"  ✅ {layer_name}: {out} ({len(merged)} features)")
+
+    return results
+
+
+def step_osm(boundary: gpd.GeoDataFrame, output_dir: Path,
+             source: str = "auto", refresh_vn_data: bool = False) -> Dict[str, Optional[Path]]:
+    """Fetch OSM-derived layers using selected source."""
+    source = (source or "auto").lower().strip()
+    if source in {"geofabrik", "auto"}:
+        geo = _step_osm_geofabrik(boundary, output_dir, refresh=refresh_vn_data)
+        # Keep auto-fallback behavior if Geofabrik did not produce enough data.
+        if source == "auto" and (geo.get("roads") is None or geo.get("rivers") is None):
+            log.info("  Geofabrik incomplete, fallback to Overpass...")
+            ov = _step_osm_overpass(boundary, output_dir)
+            for k, v in ov.items():
+                if geo.get(k) is None and v is not None:
+                    geo[k] = v
+        return geo
+    return _step_osm_overpass(boundary, output_dir)
 
 
 # ════════════════════════════════════════════════════════
@@ -1860,58 +2060,16 @@ def step_stack(raster_paths: dict, dist_paths: dict, output_dir: Path, grid: dic
 # ════════════════════════════════════════════════════════
 #  MAIN CLI
 # ════════════════════════════════════════════════════════
-@click.command()
-@click.option('--province', default=None, help='Province name (Vietnamese, 2025 or legacy)')
-@click.option('--resolution', default=5.0, type=float, help='Target resolution (m)')
-@click.option('--contour-interval', default=10.0, type=float, help='Contour interval (m)')
-@click.option('--output-dir', default=None, type=str, help='Output directory')
-@click.option('--legacy-boundaries', is_flag=True, default=False,
-              help='Use old 63-province boundaries (skip 2025 merger)')
-@click.option('--list-provinces', is_flag=True, default=False,
-              help='List all available province names and exit')
-def main(province, resolution, contour_interval, output_dir,
-         legacy_boundaries, list_provinces):
-    """
-    Provincial GIS Pipeline (Vietnam).
-
-    Downloads and processes geospatial, demographic, and socioeconomic
-    layers for a province. Supports 2025 merger (NQ 202/2025/QH15):
-    63 provinces → 34 units.
-
-    \b
-    Examples:
-        python pipeline.py --province "Quảng Ngãi"           # 2025: Kon Tum + Quảng Ngãi
-        python pipeline.py --province "Hồ Chí Minh"          # 2025: BD + BRVT + HCM
-        python pipeline.py --province "Lào Cai" --legacy-boundaries  # Old single province
-        python pipeline.py --list-provinces
-    """
-    if list_provinces:
-        log.info("═" * 60)
-        log.info("  AVAILABLE PROVINCES")
-        log.info("═" * 60)
-        log.info("\n  ── 2025 Provinces (34 units, NQ 202/2025/QH15) ──")
-        for new_name, old_names in sorted(PROVINCE_MERGER_2025.items()):
-            if len(old_names) > 1:
-                log.info(f"    {new_name:<16} ← {', '.join(old_names)}")
-            else:
-                log.info(f"    {new_name:<16}   (unchanged)")
-        log.info(f"\n  Use --legacy-boundaries to access old 63-province GADM names.")
-        return
-
-    if not province:
-        raise click.UsageError("--province is required (or use --list-provinces)")
-
+def _run_single_province(province: str, resolution: float, contour_interval: float,
+                         output_dir: Path, legacy_boundaries: bool,
+                         osm_source: str, refresh_vn_data: bool):
+    """Run full pipeline for one province."""
     log.info("[*] PROVINCIAL GIS PIPELINE (Vietnam)")
     log.info(f"   Province:   {province}")
     log.info(f"   Resolution: {resolution}m")
     log.info(f"   Boundaries: {'Legacy (63 provinces)' if legacy_boundaries else '2025 Merger (34 units)'}")
     log.info("")
 
-    safe_name = province.replace(" ", "_").replace(".", "")
-    if output_dir is None:
-        output_dir = Path("data") / "province" / safe_name
-    else:
-        output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     log.info(f"   Output: {output_dir.resolve()}")
     log.info("")
@@ -1935,7 +2093,8 @@ def main(province, resolution, contour_interval, output_dir,
     contour_path = step_contour(terrain_paths['dem'], output_dir, contour_interval)
 
     # ── Step 5: OSM ──
-    osm_paths = step_osm(boundary, output_dir)
+    osm_paths = step_osm(boundary, output_dir, source=osm_source,
+                         refresh_vn_data=refresh_vn_data)
 
     # ── Step 6a: WorldCover ──
     lc_path = step_landcover(boundary, output_dir)
@@ -1999,6 +2158,112 @@ def main(province, resolution, contour_interval, output_dir,
         if f.is_file() and 'raw' not in str(f) and 'native' not in str(f):
             size = f.stat().st_size / (1024 * 1024)
             log.info(f"     {f.relative_to(output_dir)}  ({size:.1f} MB)")
+
+
+@click.command()
+@click.option('--province', default="", help='Province name (optional). Leave empty to run all Vietnam')
+@click.option('--resolution', default=5.0, type=float, help='Target resolution (m)')
+@click.option('--contour-interval', default=10.0, type=float, help='Contour interval (m)')
+@click.option('--output-dir', default=None, type=str, help='Output directory')
+@click.option('--legacy-boundaries', is_flag=True, default=False,
+              help='Use old 63-province boundaries (skip 2025 merger)')
+@click.option('--list-provinces', is_flag=True, default=False,
+              help='List all available province names and exit')
+@click.option('--osm-source', type=click.Choice(['auto', 'geofabrik', 'overpass']),
+              default='geofabrik', show_default=True,
+              help='Infrastructure source for Vietnam OSM layers')
+@click.option('--refresh-vn-data', is_flag=True, default=False,
+              hidden=True,
+              help='Force refresh Vietnam source datasets (Geofabrik/GADM/ODMekong)')
+@click.option('--crawl-vn-data-only', is_flag=True, default=False,
+              hidden=True,
+              help='Only crawl/update Vietnam datasets then exit')
+def main(province, resolution, contour_interval, output_dir,
+         legacy_boundaries, list_provinces, osm_source,
+         refresh_vn_data, crawl_vn_data_only):
+    """
+    Provincial GIS Pipeline (Vietnam).
+
+    Country-first GIS Pipeline (Vietnam).
+
+    By default (no --province), runs all 34 provinces in the 2025 structure.
+    You can still run a single province with --province.
+
+    \b
+    Examples:
+        python pipeline.py                               # Whole Vietnam (34 provinces)
+        python pipeline.py --province "Hồ Chí Minh"     # One province
+        python pipeline.py --list-provinces
+    """
+    if list_provinces:
+        log.info("═" * 60)
+        log.info("  AVAILABLE PROVINCES")
+        log.info("═" * 60)
+        log.info("\n  ── 2025 Provinces (34 units, NQ 202/2025/QH15) ──")
+        for new_name, old_names in sorted(PROVINCE_MERGER_2025.items()):
+            if len(old_names) > 1:
+                log.info(f"    {new_name:<16} ← {', '.join(old_names)}")
+            else:
+                log.info(f"    {new_name:<16}   (unchanged)")
+        log.info(f"\n  Use --legacy-boundaries to access old 63-province GADM names.")
+        return
+
+    if crawl_vn_data_only:
+        crawl_vietnam_data(force_refresh=refresh_vn_data)
+        return
+
+    province = (province or "").strip()
+    if province:
+        safe_name = province.replace(" ", "_").replace(".", "")
+        if output_dir is None:
+            out_dir = Path("data") / "province" / safe_name
+        else:
+            out_dir = Path(output_dir)
+        _run_single_province(
+            province, resolution, contour_interval, out_dir,
+            legacy_boundaries, osm_source, refresh_vn_data)
+        return
+
+    # Default mode: run all 34 provinces for whole Vietnam.
+    if output_dir is None:
+        base_out = Path("data") / "province"
+    else:
+        base_out = Path(output_dir)
+    base_out.mkdir(parents=True, exist_ok=True)
+
+    provinces = sorted(PROVINCE_MERGER_2025.keys())
+    log.info("═" * 60)
+    log.info("🇻🇳 WHOLE VIETNAM MODE")
+    log.info("═" * 60)
+    log.info(f"  Provinces to run: {len(provinces)}")
+    log.info(f"  Output base dir:  {base_out.resolve()}")
+    log.info(f"  OSM source:       {osm_source}")
+    log.info("")
+
+    failed = []
+    for i, p in enumerate(provinces, 1):
+        safe_name = p.replace(" ", "_").replace(".", "")
+        out_dir = base_out / safe_name
+        log.info("─" * 60)
+        log.info(f"[{i}/{len(provinces)}] {p}")
+        log.info("─" * 60)
+        try:
+            _run_single_province(
+                p, resolution, contour_interval, out_dir,
+                legacy_boundaries, osm_source, refresh_vn_data)
+        except Exception as e:
+            log.error(f"❌ Failed: {p}: {e}")
+            failed.append((p, str(e)))
+
+    log.info("")
+    log.info("═" * 60)
+    if failed:
+        log.warning(f"⚠ Completed with failures: {len(failed)}/{len(provinces)}")
+        for p, err in failed:
+            log.warning(f"  - {p}: {err}")
+    else:
+        log.info(f"✅ Completed all provinces: {len(provinces)}/{len(provinces)}")
+    log.info("═" * 60)
 
 
 if __name__ == '__main__':
