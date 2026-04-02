@@ -424,19 +424,53 @@ def get_utm_epsg(lon: float, lat: float) -> int:
     return 32600 + zone if lat >= 0 else 32700 + zone
 
 
+def _build_overviews(path: Path):
+    """Add GDAL overview pyramids to an existing GeoTIFF for fast low-zoom reads."""
+    with rasterio.open(path, 'r+') as ds:
+        factors = [f for f in [2, 4, 8, 16]
+                   if ds.width // f >= 1 and ds.height // f >= 1]
+        if factors:
+            ds.build_overviews(factors, Resampling.average)
+            ds.update_tags(ns='rio_overview', resampling='average')
+
+
+def _write_layer_stats(tif_path: Path):
+    """Compute 2nd/98th percentile stats and write a sidecar JSON for the tile server."""
+    try:
+        with rasterio.open(tif_path) as src:
+            data = src.read(1).astype(float)
+            nd = src.nodata
+        if nd is not None:
+            data[data == nd] = np.nan
+        valid = data[~np.isnan(data)]
+        if len(valid) == 0:
+            return
+        vmin = float(np.percentile(valid, 2))
+        vmax = float(np.percentile(valid, 98))
+        if vmax - vmin < 1e-6:
+            return
+        stats_path = tif_path.with_suffix('.stats.json')
+        stats_path.write_text(json.dumps({"vmin": vmin, "vmax": vmax}))
+    except Exception as e:
+        log.warning(f"  Could not write stats for {tif_path.name}: {e}")
+
+
 def write_raster(data: np.ndarray, path: Path, crs, transform,
                  nodata: float = -9999.0, dtype='float32'):
-    """Write a numpy array to GeoTIFF."""
+    """Write a numpy array as a tiled GeoTIFF with GDAL overviews."""
     if data.ndim == 2:
         data = data[np.newaxis, :]
     profile = {
         'driver': 'GTiff', 'dtype': dtype,
         'width': data.shape[2], 'height': data.shape[1], 'count': data.shape[0],
-        'crs': crs, 'transform': transform, 'nodata': nodata, 'compress': 'lzw',
+        'crs': crs, 'transform': transform, 'nodata': nodata,
+        'compress': 'deflate', 'tiled': True,
+        'blockxsize': 256, 'blockysize': 256,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     with rasterio.open(path, 'w', **profile) as dst:
         dst.write(data)
+    _build_overviews(path)
 
 
 def compute_target_grid(boundary: gpd.GeoDataFrame, target_crs: str, res: float) -> dict:
@@ -476,7 +510,6 @@ def clip_raster_to_boundary(src_path: Path, dst_path: Path,
     boundary_reproj = boundary.to_crs(target_crs)
     geom = [mapping(boundary_reproj.geometry.values[0])]
     with rasterio.open(src_path) as src:
-        # Use appropriate nodata for the dtype
         dtype = src.dtypes[0]
         if np.issubdtype(np.dtype(dtype), np.unsignedinteger):
             nd = 0
@@ -488,10 +521,14 @@ def clip_raster_to_boundary(src_path: Path, dst_path: Path,
         profile = src.profile.copy()
         profile.update({
             'height': clipped.shape[1], 'width': clipped.shape[2],
-            'transform': clipped_tf, 'nodata': nd, 'compress': 'lzw',
+            'transform': clipped_tf, 'nodata': nd,
+            'compress': 'deflate', 'tiled': True,
+            'blockxsize': 256, 'blockysize': 256,
         })
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
     with rasterio.open(dst_path, 'w', **profile) as dst:
         dst.write(clipped)
+    _build_overviews(dst_path)
 
 
 # ════════════════════════════════════════════════════════
@@ -652,6 +689,7 @@ def step_dem(boundary: gpd.GeoDataFrame, output_dir: Path) -> Path:
     log.info("  Clipping to province...")
     dem_path = output_dir / "dem_clipped.tif"
     clip_raster_to_boundary(merged_path, dem_path, boundary, "EPSG:4326")
+    _write_layer_stats(dem_path)
     log.info(f"  ✅ DEM saved: {dem_path}")
     return dem_path
 
@@ -775,6 +813,7 @@ def step_terrain(dem_path: Path, output_dir: Path,
                        ('slope', slope), ('aspect', aspect)]:
         p = native / f"{name}.tif"
         write_raster(data, p, target_crs, tf)
+        _write_layer_stats(p)
         results[name] = p
         log.info(f"  {name}: {p}")
 
@@ -1025,6 +1064,7 @@ def step_landcover(boundary: gpd.GeoDataFrame, output_dir: Path) -> Optional[Pat
     lc_path = output_dir / "native" / "landcover.tif"
     lc_path.parent.mkdir(exist_ok=True)
     clip_raster_to_boundary(merged_path, lc_path, boundary, "EPSG:4326")
+    _write_layer_stats(lc_path)
     log.info(f"  ✅ Landcover: {lc_path}")
     return lc_path
 

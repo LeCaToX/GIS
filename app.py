@@ -11,8 +11,10 @@ Usage:
 import io
 import json
 import shutil
+import threading
+from functools import lru_cache
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional, Dict, Tuple
 
 import math
 
@@ -54,8 +56,10 @@ LAYER_CONFIG: Dict[str, dict] = {
     "hillshade":  {"cmap": "gray",        "vmin": 0,    "vmax": 255},
     "dem":        {"cmap": "gist_earth",   "vmin": 0,    "vmax": 2500},
     "slope":      {"cmap": "YlOrRd",       "vmin": 0,    "vmax": 45},
-    "aspect":     {"cmap": "hsv",          "vmin": 0,    "vmax": 360},
+    "aspect":     {"cmap": "twilight",     "vmin": 0,    "vmax": 360},
 }
+
+_NEAREST_LAYERS = {"landcover", "aspect"}
 
 # Per-province auto-scale cache: {(province_safe, layer): (vmin, vmax)}
 _stats_cache: Dict[tuple, tuple] = {}
@@ -70,6 +74,61 @@ def _empty_tile() -> bytes:
         Image.new("RGBA", (256, 256), (0, 0, 0, 0)).save(buf, "PNG")
         _EMPTY_PNG = buf.getvalue()
     return _EMPTY_PNG
+
+# ── Rasterio dataset handle cache (thread-safe) ───────
+_ds_cache: Dict[str, rasterio.DatasetReader] = {}
+_ds_lock = threading.Lock()
+
+def _open_raster(tif_path: str) -> rasterio.DatasetReader:
+    """Return a cached rasterio dataset handle, opening if needed."""
+    with _ds_lock:
+        ds = _ds_cache.get(tif_path)
+        if ds is not None and not ds.closed:
+            return ds
+        ds = rasterio.open(tif_path)
+        if len(_ds_cache) >= 32:
+            oldest_key = next(iter(_ds_cache))
+            try:
+                _ds_cache.pop(oldest_key).close()
+            except Exception:
+                pass
+        _ds_cache[tif_path] = ds
+        return ds
+
+# ── In-memory rendered tile LRU cache ─────────────────
+@lru_cache(maxsize=4096)
+def _cached_tile_render(tif_path: str, layer: str, z: int, x: int, y: int,
+                        vmin: float, vmax: float) -> bytes:
+    """Reproject + colorize a tile, cached by coordinates."""
+    tile_bounds = _tile_bounds(z, x, y)
+    dst_transform = from_bounds(*tile_bounds, 256, 256)
+
+    src = _open_raster(tif_path)
+    nodata = src.nodata
+    dtype = src.dtypes[0]
+
+    fill_val = nodata if nodata is not None else -9999.0
+    dst_data = np.full((256, 256), fill_val, dtype=dtype)
+
+    resamp = Resampling.nearest if layer in _NEAREST_LAYERS else Resampling.bilinear
+    reproject(
+        source=rasterio.band(src, 1),
+        destination=dst_data,
+        src_transform=src.transform,
+        src_crs=src.crs,
+        dst_transform=dst_transform,
+        dst_crs="EPSG:3857",
+        resampling=resamp,
+        dst_nodata=fill_val,
+    )
+
+    mask = np.ones((256, 256), dtype=np.uint8) * 255
+    if fill_val is not None:
+        mask[dst_data == fill_val] = 0
+    float_data = dst_data.astype(float)
+    mask[np.isnan(float_data)] = 0
+
+    return _render_tile(float_data, mask, layer, vmin=vmin, vmax=vmax)
 
 # ── FastAPI app ────────────────────────────────────────
 app = FastAPI(title="Vietnam GIS Explorer", version="1.0")
@@ -201,18 +260,15 @@ def _build_merged_boundaries():
 
 # ── Auto-scale: percentile-based vmin/vmax ─────────────
 
-def _get_layer_range(pdir: Path, layer: str) -> tuple:
-    """Return (vmin, vmax) for a raster layer, using cached percentile stats."""
+def _get_layer_range(pdir: Path, layer: str) -> Tuple[float, float]:
+    """Return (vmin, vmax) for a raster layer, preferring sidecar stats JSON."""
     safe_name = pdir.name
     key = (safe_name, layer)
     if key in _stats_cache:
         return _stats_cache[key]
 
     cfg = LAYER_CONFIG.get(layer)
-    if cfg:
-        fallback = (cfg["vmin"], cfg["vmax"])
-    else:
-        fallback = (0, 1)
+    fallback = (cfg["vmin"], cfg["vmax"]) if cfg else (0, 1)
 
     tif = pdir / f"{layer}.tif"
     if not tif.exists():
@@ -220,6 +276,16 @@ def _get_layer_range(pdir: Path, layer: str) -> tuple:
     if not tif.exists():
         _stats_cache[key] = fallback
         return fallback
+
+    stats_file = tif.with_suffix(".stats.json")
+    if stats_file.exists():
+        try:
+            s = json.loads(stats_file.read_text())
+            result = (float(s["vmin"]), float(s["vmax"]))
+            _stats_cache[key] = result
+            return result
+        except Exception:
+            pass
 
     try:
         with rasterio.open(tif) as src:
@@ -244,28 +310,30 @@ def _get_layer_range(pdir: Path, layer: str) -> tuple:
 
 # ── Tile renderer ──────────────────────────────────────
 
+_LC_LUT = np.zeros((256, 4), dtype=np.uint8)
+for _cls_id, (_, _, _hex) in LANDCOVER_CLASSES.items():
+    if _cls_id < 256:
+        _LC_LUT[_cls_id] = [int(_hex[1:3], 16), int(_hex[3:5], 16),
+                            int(_hex[5:7], 16), 220]
+
 def _render_tile(data: np.ndarray, mask: np.ndarray, layer: str,
                  vmin: float = 0, vmax: float = 1) -> bytes:
-    """Colorize a single-band tile array → RGBA PNG bytes."""
+    """Colorize a single-band tile array to RGBA PNG bytes."""
     h, w = data.shape
 
     if layer == "landcover":
-        rgba = np.zeros((h, w, 4), dtype=np.uint8)
-        for cls_id, (_, _, color) in LANDCOVER_CLASSES.items():
-            r = int(color[1:3], 16)
-            g = int(color[3:5], 16)
-            b = int(color[5:7], 16)
-            rgba[data == cls_id] = [r, g, b, 200]
+        idx = np.clip(data.astype(int), 0, 255)
+        rgba = _LC_LUT[idx].copy()
         rgba[mask == 0, 3] = 0
     else:
         cfg = LAYER_CONFIG.get(layer, {"cmap": "viridis"})
         cmap = mpl_cm.get_cmap(cfg["cmap"])
-        normed = np.clip((data.astype(float) - vmin) / max(vmax - vmin, 1e-6), 0, 1)
+        normed = np.clip((data - vmin) / max(vmax - vmin, 1e-6), 0, 1)
         rgba = (cmap(normed) * 255).astype(np.uint8)
-        rgba[..., 3] = np.where(mask > 0, 200, 0)
+        rgba[..., 3] = np.where(mask > 0, 220, 0)
 
     buf = io.BytesIO()
-    Image.fromarray(rgba, "RGBA").save(buf, "PNG", optimize=True)
+    Image.fromarray(rgba, "RGBA").save(buf, "PNG")
     return buf.getvalue()
 
 # ═══════════════════════════════════════════════════════
@@ -412,18 +480,17 @@ def _tile_bounds(z: int, x: int, y: int):
 
 
 @app.get("/api/provinces/{name}/tiles/{layer}/{z}/{x}/{y}.png")
-async def tile(name: str, layer: str, z: int, x: int, y: int):
+def tile(name: str, layer: str, z: int, x: int, y: int):
     matched = _resolve(name)
     if not matched:
         raise HTTPException(404)
 
     pdir = _pdir(matched)
+    headers = {"Cache-Control": "public, max-age=86400"}
 
-    # Disk cache: serve pre-rendered tile if available
     cache_path = pdir / "tiles" / layer / str(z) / str(x) / f"{y}.png"
     if cache_path.exists():
-        return FileResponse(cache_path, media_type="image/png",
-                            headers={"Cache-Control": "public, max-age=86400"})
+        return FileResponse(cache_path, media_type="image/png", headers=headers)
 
     tif = pdir / f"{layer}.tif"
     if not tif.exists():
@@ -432,51 +499,23 @@ async def tile(name: str, layer: str, z: int, x: int, y: int):
         return Response(content=_empty_tile(), media_type="image/png")
 
     try:
-        tile_bounds = _tile_bounds(z, x, y)
-        dst_transform = from_bounds(*tile_bounds, 256, 256)
-
-        with rasterio.open(tif) as src:
-            src_bounds_3857 = transform_bounds(src.crs, "EPSG:3857", *src.bounds)
-            tb = tile_bounds
-            if (tb[2] < src_bounds_3857[0] or tb[0] > src_bounds_3857[2] or
-                    tb[3] < src_bounds_3857[1] or tb[1] > src_bounds_3857[3]):
-                return Response(content=_empty_tile(), media_type="image/png")
-
-            is_categorical = layer in ("landcover",)
-            resamp = Resampling.nearest if is_categorical else Resampling.bilinear
-            nodata = src.nodata
-            dtype = src.dtypes[0]
-
-            dst_data = np.zeros((256, 256), dtype=dtype)
-            reproject(
-                source=rasterio.band(src, 1),
-                destination=dst_data,
-                src_transform=src.transform,
-                src_crs=src.crs,
-                dst_transform=dst_transform,
-                dst_crs="EPSG:3857",
-                resampling=resamp,
-                dst_nodata=nodata,
-            )
-
-        mask = np.ones((256, 256), dtype=np.uint8) * 255
-        if nodata is not None:
-            mask[dst_data == nodata] = 0
-        mask[np.isnan(dst_data.astype(float))] = 0
+        src = _open_raster(str(tif))
+        src_bounds_3857 = transform_bounds(src.crs, "EPSG:3857", *src.bounds)
+        tb = _tile_bounds(z, x, y)
+        if (tb[2] < src_bounds_3857[0] or tb[0] > src_bounds_3857[2] or
+                tb[3] < src_bounds_3857[1] or tb[1] > src_bounds_3857[3]):
+            return Response(content=_empty_tile(), media_type="image/png")
 
         vmin, vmax = _get_layer_range(pdir, layer)
-        content = _render_tile(dst_data.astype(float), mask, layer,
-                               vmin=vmin, vmax=vmax)
+        content = _cached_tile_render(str(tif), layer, z, x, y, vmin, vmax)
 
-        # Write to disk cache for future requests
         try:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             cache_path.write_bytes(content)
         except Exception:
             pass
 
-        return Response(content=content, media_type="image/png",
-                        headers={"Cache-Control": "public, max-age=86400"})
+        return Response(content=content, media_type="image/png", headers=headers)
     except Exception:
         return Response(content=_empty_tile(), media_type="image/png")
 

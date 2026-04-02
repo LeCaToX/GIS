@@ -95,6 +95,7 @@ export default function App() {
   const mapNode = useRef(null)
   const mapRef = useRef(null)
   const popupRef = useRef(null)
+  const abortRef = useRef(null)
 
   const [provinces, setProvinces] = useState([])
   const [boundaryData, setBoundaryData] = useState({ type: 'FeatureCollection', features: [] })
@@ -111,6 +112,12 @@ export default function App() {
     () => provinces.find((p) => p.name === selectedProvince) || null,
     [provinces, selectedProvince]
   )
+
+  useEffect(() => {
+    if (!error) return
+    const t = setTimeout(() => setError(''), 5000)
+    return () => clearTimeout(t)
+  }, [error])
 
   useEffect(() => {
     if (!mapNode.current || mapRef.current) return
@@ -148,14 +155,6 @@ export default function App() {
       mapRef.current = null
     }
   }, [])
-
-  useEffect(() => {
-    const map = mapRef.current
-    if (!map) return
-    removeDynamicMapLayers(map)
-    setActiveRaster('')
-    setActiveVectors({})
-  }, [selectedProvince])
 
   function renderNational(fc) {
     const map = mapRef.current
@@ -243,17 +242,28 @@ export default function App() {
   }
 
   async function chooseProvince(name) {
-    setSelectedProvince(name)
-    setLoadingProvince(true)
-    setError('')
+    if (abortRef.current) abortRef.current.abort()
+    const ac = new AbortController()
+    abortRef.current = ac
+
     const map = mapRef.current
     if (!map) return
 
+    removeDynamicMapLayers(map)
+    setSelectedProvince(name)
+    setStats(null)
+    setActiveRaster('')
+    setActiveVectors({})
+    setLoadingProvince(true)
+    setError('')
+
     try {
       const [layerRes, statRes] = await Promise.all([
-        fetch(`/api/provinces/${encodeURIComponent(name)}/layers`).then((r) => r.json()),
-        fetch(`/api/provinces/${encodeURIComponent(name)}/stats`).then((r) => r.json()),
+        fetch(`/api/provinces/${encodeURIComponent(name)}/layers`, { signal: ac.signal }).then((r) => r.json()),
+        fetch(`/api/provinces/${encodeURIComponent(name)}/stats`, { signal: ac.signal }).then((r) => r.json()),
       ])
+      if (ac.signal.aborted) return
+
       setAvailable(layerRes)
       setStats(statRes)
 
@@ -262,7 +272,6 @@ export default function App() {
       }
 
       try {
-        // Use national merged boundary source for stable topology (fewer slivers/holes).
         const feature = boundaryData.features.find((f) => f?.properties?.name === name)
         if (feature) {
           const selectedFc = { type: 'FeatureCollection', features: [feature] }
@@ -276,7 +285,11 @@ export default function App() {
           fitGeoJSON(map, selectedFc)
         }
 
-        const bnd = await fetch(`/api/provinces/${encodeURIComponent(name)}/boundary`).then((r) => r.json())
+        const bnd = await fetch(
+          `/api/provinces/${encodeURIComponent(name)}/boundary`, { signal: ac.signal }
+        ).then((r) => r.json())
+        if (ac.signal.aborted) return
+
         if (bnd.internal) {
           map.addSource('internal-boundary', { type: 'geojson', data: bnd.internal })
           map.addLayer({
@@ -286,17 +299,19 @@ export default function App() {
             paint: { 'line-color': '#64748b', 'line-dasharray': [2, 2], 'line-width': 1 },
           })
         }
-      } catch {
-        // Not processed yet.
+      } catch (e) {
+        if (e?.name === 'AbortError') return
       }
-    } catch {
+    } catch (e) {
+      if (e?.name === 'AbortError') return
       setError('Failed loading selected province')
     } finally {
-      setLoadingProvince(false)
+      if (!ac.signal.aborted) setLoadingProvince(false)
     }
   }
 
   function backToVietnam() {
+    if (abortRef.current) abortRef.current.abort()
     const map = mapRef.current
     if (!map) return
     setSelectedProvince('')
@@ -307,6 +322,10 @@ export default function App() {
     removeDynamicMapLayers(map)
     if (map.getLayer('province-selected-fill')) {
       map.setFilter('province-selected-fill', ['==', ['get', 'name'], ''])
+      map.setPaintProperty('province-selected-fill', 'fill-opacity', 0.12)
+    }
+    if (map.getLayer('province-fill')) {
+      map.setPaintProperty('province-fill', 'fill-opacity', 0.30)
     }
     fitGeoJSON(map, boundaryData)
   }
@@ -491,7 +510,7 @@ export default function App() {
                   <p className="group-title">{group}</p>
                   {list.map((l) => (
                     <label key={l.id} className="row">
-                      <input type="checkbox" checked={activeRaster === l.id} onChange={() => toggleRaster(l.id)} />
+                      <input type="radio" name="raster-layer" checked={activeRaster === l.id} onClick={() => toggleRaster(l.id)} onChange={() => {}} />
                       {l.label}
                     </label>
                   ))}
@@ -539,7 +558,7 @@ export default function App() {
 
       <aside className="right-panel glass">
         <h3>Statistics</h3>
-        {!stats && <p className="muted">Click a province</p>}
+        {!stats && !loadingProvince && <p className="muted">Click a province</p>}
         {loadingProvince && <p className="muted">Loading...</p>}
         {stats && !loadingProvince && (
           <div className="stats">
@@ -569,7 +588,7 @@ export default function App() {
       )}
 
       {error && (
-        <div className="toast">{error}</div>
+        <div className="toast" onClick={() => setError('')}>{error}</div>
       )}
     </div>
   )
