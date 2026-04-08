@@ -3,38 +3,53 @@ import maplibregl from 'maplibre-gl'
 import './App.css'
 
 const RASTER_LAYERS = [
-  { id: 'hillshade', label: 'Hillshade', group: 'Terrain' },
-  { id: 'dem', label: 'Elevation', group: 'Terrain' },
-  { id: 'slope', label: 'Slope', group: 'Terrain' },
-  { id: 'aspect', label: 'Aspect', group: 'Terrain' },
-  { id: 'landcover', label: 'Land Cover', group: 'Landcover' },
+  { id: 'hillshade', label: 'Đổ bóng địa hình', group: 'Địa hình' },
+  { id: 'dem', label: 'Độ cao (DEM)', group: 'Địa hình' },
+  { id: 'slope', label: 'Độ dốc', group: 'Địa hình' },
+  { id: 'aspect', label: 'Hướng dốc', group: 'Địa hình' },
+  { id: 'landcover', label: 'Lớp phủ bề mặt', group: 'Lớp phủ' },
+  { id: 'p_lsi', label: 'Xác suất sạt lở (p_lsi)', group: 'Nguy cơ' },
+  { id: 'c_lsi', label: 'Phân loại nguy cơ (c_lsi)', group: 'Nguy cơ' },
 ]
 
 const RASTER_LEGENDS = {
-  hillshade: { title: 'Hillshade', items: [
-    { color: '#222', label: 'Shadow' }, { color: '#888', label: 'Flat' }, { color: '#eee', label: 'Sunlit' },
+  hillshade: { title: 'Đổ bóng địa hình', items: [
+    { color: '#222', label: 'Bóng' }, { color: '#888', label: 'Phẳng' }, { color: '#eee', label: 'Sáng' },
   ]},
-  dem: { title: 'Elevation (m)', items: [
-    { color: '#234f1e', label: 'Low' }, { color: '#8cbc70', label: '' },
-    { color: '#f5deb3', label: '' }, { color: '#a0522d', label: '' }, { color: '#fff', label: 'High' },
+  dem: { title: 'Độ cao (m)', items: [
+    { color: '#234f1e', label: 'Thấp' }, { color: '#8cbc70', label: '' },
+    { color: '#f5deb3', label: '' }, { color: '#a0522d', label: '' }, { color: '#fff', label: 'Cao' },
   ]},
-  slope: { title: 'Slope (degrees)', items: [
+  slope: { title: 'Độ dốc (độ)', items: [
     { color: '#ffffb2', label: '0' }, { color: '#fd8d3c', label: '15' }, { color: '#bd0026', label: '45+' },
   ]},
-  aspect: { title: 'Aspect (direction)', items: [
+  aspect: { title: 'Hướng dốc', items: [
     { color: '#f00', label: 'N' }, { color: '#ff0', label: 'E' },
     { color: '#0f0', label: 'S' }, { color: '#00f', label: 'W' }, { color: '#f00', label: 'N' },
   ]},
-  landcover: { title: 'Land Cover', items: [
-    { color: '#006400', label: 'Forest' }, { color: '#F096FF', label: 'Cropland' },
-    { color: '#FA0000', label: 'Urban' }, { color: '#0064C8', label: 'Water' },
-    { color: '#FFBB22', label: 'Shrub' }, { color: '#B4B4B4', label: 'Bare' },
+  landcover: { title: 'Lớp phủ bề mặt', items: [
+    { color: '#006400', label: 'Rừng' }, { color: '#F096FF', label: 'Nông nghiệp' },
+    { color: '#FA0000', label: 'Đô thị' }, { color: '#0064C8', label: 'Nước' },
+    { color: '#FFBB22', label: 'Cây bụi' }, { color: '#B4B4B4', label: 'Đất trống' },
+  ]},
+  p_lsi: { title: 'p_lsi (0–1)', items: [
+    { color: '#ffffcc', label: '0.0' }, { color: '#fed976', label: '' },
+    { color: '#fd8d3c', label: '' }, { color: '#e31a1c', label: '1.0' },
+  ]},
+  c_lsi: { title: 'c_lsi (1–5)', items: [
+    { color: '#2c7bb6', label: '1 rất thấp' },
+    { color: '#abd9e9', label: '2 thấp' },
+    { color: '#ffffbf', label: '3 trung bình' },
+    { color: '#fdae61', label: '4 cao' },
+    { color: '#d7191c', label: '5 rất cao' },
   ]},
 }
 
 const VECTOR_LAYERS = [
-  { id: 'infrastructure', label: 'Infrastructure', type: 'circle', color: '#ff8f00' },
-  { id: 'contour', label: 'Contours', type: 'line', color: '#7b5d2a' },
+  { id: 'infrastructure', label: 'Hạ tầng', type: 'circle', color: '#ff8f00' },
+  { id: 'contour', label: 'Đường đồng mức', type: 'line', color: '#7b5d2a' },
+  // Do not show coordinate details on-map for this research dataset.
+  { id: 'real_ls_point', label: 'Điểm sạt lở thực tế', type: 'circle', color: '#22c55e' },
 ]
 
 const vietnamStyle = {
@@ -96,6 +111,7 @@ export default function App() {
   const mapRef = useRef(null)
   const popupRef = useRef(null)
   const abortRef = useRef(null)
+  const vecHandlersRef = useRef({})
 
   const [provinces, setProvinces] = useState([])
   const [boundaryData, setBoundaryData] = useState({ type: 'FeatureCollection', features: [] })
@@ -374,6 +390,8 @@ export default function App() {
       type: 'raster',
       tiles: [`/api/provinces/${encodeURIComponent(selectedProvince)}/tiles/${layerId}/{z}/{x}/{y}.png`],
       tileSize: 256,
+      // ~30m rasters gain little past z≈16; cap requests to avoid GDAL OOM on tile bursts
+      maxzoom: 16,
     })
     map.addLayer({
       id: 'active-raster-layer',
@@ -397,6 +415,17 @@ export default function App() {
     const layerMapId = `vec-layer-${layerId}`
 
     if (map.getLayer(layerMapId)) {
+      const hs = vecHandlersRef.current[layerMapId]
+      if (hs) {
+        try {
+          map.off('mouseenter', layerMapId, hs.onEnter)
+          map.off('mouseleave', layerMapId, hs.onLeave)
+          map.off('click', layerMapId, hs.onClick)
+        } catch {
+          // ignore
+        }
+        delete vecHandlersRef.current[layerMapId]
+      }
       map.removeLayer(layerMapId)
       if (map.getSource(sourceId)) map.removeSource(sourceId)
       setActiveVectors((s) => ({ ...s, [layerId]: false }))
@@ -432,12 +461,40 @@ export default function App() {
           minzoom: 10,
           paint: {
             'circle-color': cfg.color,
-            'circle-radius': 2,
-            'circle-opacity': 0.75,
+            'circle-radius': layerId === 'real_ls_point' ? 3 : 2,
+            'circle-opacity': layerId === 'real_ls_point' ? 0.85 : 0.75,
             'circle-stroke-width': 0,
           },
         })
       }
+
+      // For sensitive research points: allow inspection, but do NOT show coordinates.
+      if (layerId === 'real_ls_point') {
+        const onEnter = () => { map.getCanvas().style.cursor = 'pointer' }
+        const onLeave = () => { map.getCanvas().style.cursor = '' }
+        const onClick = (e) => {
+          const f = e.features?.[0]
+          if (!f) return
+          const props = f.properties || {}
+          const safePairs = Object.entries(props)
+            .filter(([k, v]) => v != null && String(v).length > 0)
+            .slice(0, 8)
+            .map(([k, v]) => `<div><b>${k}</b>: ${String(v)}</div>`)
+            .join('')
+          const html = `<b>Điểm sạt lở thực tế</b>${safePairs ? `<div style="margin-top:6px">${safePairs}</div>` : ''}`
+
+          if (!popupRef.current) {
+            popupRef.current = new maplibregl.Popup({ closeButton: true, closeOnClick: true })
+          }
+          // Intentionally anchor to click location; do not print numeric coordinates.
+          popupRef.current.setLngLat(e.lngLat).setHTML(html).addTo(map)
+        }
+        map.on('mouseenter', layerMapId, onEnter)
+        map.on('mouseleave', layerMapId, onLeave)
+        map.on('click', layerMapId, onClick)
+        vecHandlersRef.current[layerMapId] = { onEnter, onLeave, onClick }
+      }
+
       setActiveVectors((s) => ({ ...s, [layerId]: true }))
     } catch {
       setError(`Cannot load vector layer: ${layerId}`)
@@ -462,7 +519,7 @@ export default function App() {
     <div className="app-shell">
       <header className="topbar">
         <div>
-          <h1 className="top-title">Vietnam GIS Explorer</h1>
+          <h1 className="top-title">Bản đồ GIS Việt Nam</h1>
           {/* <p className="top-sub">NQ 202/2025 ? Terrain ? OSM ? GSO</p> */}
         </div>
         <div className="toolbar">
@@ -474,37 +531,37 @@ export default function App() {
               if (v) void chooseProvince(v)
             }}
           >
-            <option value="">Select province</option>
+            <option value="">Chọn tỉnh/thành</option>
             {provinces.map((p) => (
               <option key={p.name} value={p.name}>
                 {p.name}{p.processed ? '' : ' (not processed)'}
               </option>
             ))}
           </select>
-          <button className="btn" onClick={refreshProvince} disabled={!selectedProvince}>Refresh</button>
-          <button className="btn" onClick={backToVietnam} disabled={!selectedProvince}>National</button>
+          <button className="btn" onClick={refreshProvince} disabled={!selectedProvince}>Tải lại</button>
+          <button className="btn" onClick={backToVietnam} disabled={!selectedProvince}>Toàn quốc</button>
         </div>
       </header>
 
       <aside className="left-panel glass">
-        <h3>Layers {selectedInfo && (<span className={selectedInfo.processed ? 'tag ok' : 'tag warn'}>{selectedInfo.processed ? 'Processed' : 'Not processed'}</span>)}</h3>
+        <h3>Lớp dữ liệu {selectedInfo && (<span className={selectedInfo.processed ? 'tag ok' : 'tag warn'}>{selectedInfo.processed ? 'Đã xử lý' : 'Chưa xử lý'}</span>)}</h3>
 
-        {!selectedProvince && <p className="muted">Select a province</p>}
+        {!selectedProvince && <p className="muted">Chọn một tỉnh/thành</p>}
 
         {selectedProvince && (
           <>
             {!selectedInfo?.processed && (
               <div className="warn-box">
-                <p>Province not processed yet.</p>
+                <p>Tỉnh/thành chưa được xử lý.</p>
                 <p className="muted">
-                  Run locally: <code>python pipeline.py --province "{selectedProvince}"</code>
+                  Chạy trên máy: <code>python pipeline.py --province "{selectedProvince}"</code>
                 </p>
               </div>
             )}
 
             <div className="panel-card">
-              <h4>Raster layers</h4>
-              {Object.keys(groupedRaster).length === 0 && <p className="muted">No raster layers</p>}
+              <h4>Lớp raster</h4>
+              {Object.keys(groupedRaster).length === 0 && <p className="muted">Không có lớp raster</p>}
               {Object.entries(groupedRaster).map(([group, list]) => (
                 <div key={group} className="group-block">
                   <p className="group-title">{group}</p>
@@ -519,7 +576,7 @@ export default function App() {
             </div>
 
             <div className="panel-card">
-              <h4>Vector layers</h4>
+              <h4>Lớp vector</h4>
               {VECTOR_LAYERS.filter((l) => available.vector.includes(l.id)).map((l) => (
                 <label key={l.id} className="row">
                   <input type="checkbox" checked={!!activeVectors[l.id]} onChange={() => void toggleVector(l.id)} />
@@ -557,9 +614,9 @@ export default function App() {
       </div>
 
       <aside className="right-panel glass">
-        <h3>Statistics</h3>
-        {!stats && !loadingProvince && <p className="muted">Click a province</p>}
-        {loadingProvince && <p className="muted">Loading...</p>}
+        <h3>Thống kê</h3>
+        {!stats && !loadingProvince && <p className="muted">Bấm chọn một tỉnh/thành</p>}
+        {loadingProvince && <p className="muted">Đang tải...</p>}
         {stats && !loadingProvince && (
           <div className="stats">
             <div className="card"><span>Population</span><b>{number(stats.population)}</b></div>
@@ -583,7 +640,7 @@ export default function App() {
 
       {loadingMap && (
         <div className="global-loading">
-          <p>Loading map...</p>
+          <p>Đang tải bản đồ...</p>
         </div>
       )}
 

@@ -10,6 +10,7 @@ Usage:
 
 import io
 import json
+import logging
 import shutil
 import threading
 from functools import lru_cache
@@ -22,9 +23,11 @@ import numpy as np
 import rasterio
 from rasterio.warp import reproject, Resampling, transform_bounds
 from rasterio.transform import from_bounds
+from rasterio.windows import Window, from_bounds as window_from_bounds
+from rasterio.features import rasterize
 import geopandas as gpd
-from shapely.geometry import Polygon, MultiPolygon, GeometryCollection
-from shapely.ops import unary_union
+from shapely.geometry import Polygon, MultiPolygon, GeometryCollection, shape
+from shapely.ops import unary_union, transform as shapely_transform
 from PIL import Image
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
@@ -43,13 +46,31 @@ import matplotlib.cm as mpl_cm
 
 _TO_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
 
+log = logging.getLogger(__name__)
+
+# Limit concurrent GDAL warp ops (each can allocate tens of MB; parallel tile
+# bursts at high zoom otherwise exhaust RAM and crash the process).
+_GDAL_WARP_SEMAPHORE = threading.BoundedSemaphore(4)
+# Window reads larger than this fall back to band-based warp (low zoom / overview path).
+_MAX_WINDOW_PIXELS = 12_000_000
+# Slippy-map zoom above which we still serve tiles; extreme z values are wasteful.
+_MAX_TILE_ZOOM = 18
+
 # ── Paths ──────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data" / "province"
+COLLECTED_DIR = BASE_DIR / "data" / "collected"
 GADM_CACHE = BASE_DIR / "data" / "gadm41_VNM_1.json"
 LEGACY_STATIC_DIR = BASE_DIR / "static"
 FRONTEND_DIST_DIR = BASE_DIR / "frontend" / "dist"
 FRONTEND_ASSETS_DIR = FRONTEND_DIST_DIR / "assets"
+
+# Some provinces are merged in 2025; collected datasets may still be stored
+# under their historical province folder.
+COLLECTED_PROVINCE_MAP: Dict[str, str] = {
+    # Quảng Nam is currently merged into Đà Nẵng in this project.
+    "Đà Nẵng": "Quảng_Nam",
+}
 
 # ── Layer rendering config ─────────────────────────────
 LAYER_CONFIG: Dict[str, dict] = {
@@ -57,9 +78,11 @@ LAYER_CONFIG: Dict[str, dict] = {
     "dem":        {"cmap": "gist_earth",   "vmin": 0,    "vmax": 2500},
     "slope":      {"cmap": "YlOrRd",       "vmin": 0,    "vmax": 45},
     "aspect":     {"cmap": "twilight",     "vmin": 0,    "vmax": 360},
+    # Landslide susceptibility (Quảng Nam mountain districts)
+    "p_lsi":      {"cmap": "YlOrRd",       "vmin": 0,    "vmax": 1},
 }
 
-_NEAREST_LAYERS = {"landcover", "aspect"}
+_NEAREST_LAYERS = {"landcover", "aspect", "c_lsi"}
 
 # Per-province auto-scale cache: {(province_safe, layer): (vmin, vmax)}
 _stats_cache: Dict[tuple, tuple] = {}
@@ -75,60 +98,179 @@ def _empty_tile() -> bytes:
         _EMPTY_PNG = buf.getvalue()
     return _EMPTY_PNG
 
-# ── Rasterio dataset handle cache (thread-safe) ───────
-_ds_cache: Dict[str, rasterio.DatasetReader] = {}
-_ds_lock = threading.Lock()
 
-def _open_raster(tif_path: str) -> rasterio.DatasetReader:
-    """Return a cached rasterio dataset handle, opening if needed."""
-    with _ds_lock:
-        ds = _ds_cache.get(tif_path)
-        if ds is not None and not ds.closed:
-            return ds
-        ds = rasterio.open(tif_path)
-        if len(_ds_cache) >= 32:
-            oldest_key = next(iter(_ds_cache))
-            try:
-                _ds_cache.pop(oldest_key).close()
-            except Exception:
-                pass
-        _ds_cache[tif_path] = ds
-        return ds
+def _png_tile_cache_valid(cache_path: Path, tif_path: Path) -> bool:
+    """Use on-disk tile only if it is newer than the GeoTIFF and stats sidecar."""
+    if not cache_path.exists():
+        return False
+    try:
+        png_m = cache_path.stat().st_mtime
+        if png_m < tif_path.stat().st_mtime:
+            return False
+        stats = tif_path.with_suffix(".stats.json")
+        if stats.exists() and png_m < stats.stat().st_mtime:
+            return False
+        return True
+    except OSError:
+        return False
+
+
+def _tile_bounds(z: int, x: int, y: int):
+    """Convert ZXY slippy-map tile to Web Mercator (EPSG:3857) bounds."""
+    n = 2.0 ** z
+
+    def _lng(tx):
+        return tx / n * 360.0 - 180.0
+
+    def _lat(ty):
+        lat_rad = math.atan(math.sinh(math.pi * (1 - 2 * ty / n)))
+        return math.degrees(lat_rad)
+
+    west, east = _lng(x), _lng(x + 1)
+    north, south = _lat(y), _lat(y + 1)
+    mx0, my0 = _TO_3857.transform(west, south)
+    mx1, my1 = _TO_3857.transform(east, north)
+    return mx0, my0, mx1, my1
+
+
+@lru_cache(maxsize=128)
+def _province_geom_3857(province_name: str):
+    """Province boundary geometry in EPSG:3857 for masking tiles."""
+    pdir = _pdir(province_name)
+    bp = pdir / "boundary.geojson"
+    geom_4326 = None
+    if bp.exists():
+        try:
+            boundary_json = json.loads(bp.read_text(encoding="utf-8"))
+            gdf_b = gpd.GeoDataFrame.from_features(boundary_json["features"], crs="EPSG:4326")
+            geom_4326 = unary_union(gdf_b.geometry)
+        except Exception:
+            geom_4326 = None
+    if geom_4326 is None:
+        try:
+            fc = _build_merged_boundaries()
+            for f in fc.get("features", []):
+                if f.get("properties", {}).get("name") == province_name:
+                    geom_4326 = shape(f.get("geometry"))
+                    break
+        except Exception:
+            geom_4326 = None
+    if geom_4326 is None:
+        return None
+    try:
+        return shapely_transform(lambda x, y: _TO_3857.transform(x, y), geom_4326)
+    except Exception:
+        return None
+
 
 # ── In-memory rendered tile LRU cache ─────────────────
+# One open dataset per render; never share handles across threads. Cap concurrent
+# GDAL warps and warp RAM so parallel z14+ tile storms do not OOM the process.
 @lru_cache(maxsize=4096)
 def _cached_tile_render(tif_path: str, layer: str, z: int, x: int, y: int,
-                        vmin: float, vmax: float) -> bytes:
+                        vmin: float, vmax: float, province_name: str) -> bytes:
     """Reproject + colorize a tile, cached by coordinates."""
     tile_bounds = _tile_bounds(z, x, y)
     dst_transform = from_bounds(*tile_bounds, 256, 256)
 
-    src = _open_raster(tif_path)
-    nodata = src.nodata
-    dtype = src.dtypes[0]
+    prov_geom = _province_geom_3857(province_name)
 
-    fill_val = nodata if nodata is not None else -9999.0
-    dst_data = np.full((256, 256), fill_val, dtype=dtype)
+    with _GDAL_WARP_SEMAPHORE:
+        with rasterio.Env(
+            GDAL_WARP_MEMORY_LIMIT=128,
+            GDAL_NUM_THREADS=1,
+        ):
+            try:
+                with rasterio.open(tif_path) as src:
+                    src_bounds_3857 = transform_bounds(
+                        src.crs, "EPSG:3857", *src.bounds
+                    )
+                    tb = tile_bounds
+                    if (tb[2] < src_bounds_3857[0] or tb[0] > src_bounds_3857[2]
+                            or tb[3] < src_bounds_3857[1]
+                            or tb[1] > src_bounds_3857[3]):
+                        return _empty_tile()
 
-    resamp = Resampling.nearest if layer in _NEAREST_LAYERS else Resampling.bilinear
-    reproject(
-        source=rasterio.band(src, 1),
-        destination=dst_data,
-        src_transform=src.transform,
-        src_crs=src.crs,
-        dst_transform=dst_transform,
-        dst_crs="EPSG:3857",
-        resampling=resamp,
-        dst_nodata=fill_val,
-    )
+                    west, south, east, north = tb[0], tb[1], tb[2], tb[3]
+                    left, bottom, right, top = transform_bounds(
+                        "EPSG:3857", src.crs,
+                        west, south, east, north,
+                        densify_pts=21,
+                    )
 
-    mask = np.ones((256, 256), dtype=np.uint8) * 255
-    if fill_val is not None:
-        mask[dst_data == fill_val] = 0
-    float_data = dst_data.astype(float)
-    mask[np.isnan(float_data)] = 0
+                    nodata = src.nodata
+                    dtype = src.dtypes[0]
+                    fill_val = nodata if nodata is not None else -9999.0
+                    dst_data = np.full((256, 256), fill_val, dtype=dtype)
+                    resamp = (
+                        Resampling.nearest if layer in _NEAREST_LAYERS
+                        else Resampling.bilinear
+                    )
 
-    return _render_tile(float_data, mask, layer, vmin=vmin, vmax=vmax)
+                    window = window_from_bounds(
+                        left, bottom, right, top, src.transform
+                    ).intersection(Window(0, 0, src.width, src.height))
+
+                    if window.width < 1 or window.height < 1:
+                        return _empty_tile()
+
+                    win_pixels = int(window.width) * int(window.height)
+                    if win_pixels <= _MAX_WINDOW_PIXELS:
+                        src_arr = src.read(1, window=window)
+                        src_tf = src.window_transform(window)
+                        reproject(
+                            source=src_arr,
+                            destination=dst_data,
+                            src_transform=src_tf,
+                            src_crs=src.crs,
+                            dst_transform=dst_transform,
+                            dst_crs="EPSG:3857",
+                            resampling=resamp,
+                            dst_nodata=fill_val,
+                        )
+                    else:
+                        reproject(
+                            source=rasterio.band(src, 1),
+                            destination=dst_data,
+                            src_transform=src.transform,
+                            src_crs=src.crs,
+                            dst_transform=dst_transform,
+                            dst_crs="EPSG:3857",
+                            resampling=resamp,
+                            dst_nodata=fill_val,
+                        )
+
+                mask = np.ones((256, 256), dtype=np.uint8) * 255
+                float_data = dst_data.astype(float)
+                # Float nodata must not use == (warp leaves values near -9999); unmasked
+                # nodata maps to black in grayscale — looks like random dark rectangles.
+                if np.issubdtype(dtype, np.floating):
+                    invalid = np.isnan(float_data) | np.isclose(
+                        float_data, float(fill_val), rtol=0, atol=1e-2
+                    )
+                else:
+                    invalid = float_data == fill_val
+                mask[invalid] = 0
+
+                # Province crop/mask: clip the rendered tile to the province boundary.
+                if prov_geom is not None:
+                    try:
+                        bmask = rasterize(
+                            [(prov_geom, 1)],
+                            out_shape=(256, 256),
+                            transform=dst_transform,
+                            fill=0,
+                            dtype="uint8",
+                            all_touched=False,
+                        )
+                        mask[bmask == 0] = 0
+                    except Exception:
+                        pass
+
+                return _render_tile(float_data, mask, layer, vmin=vmin, vmax=vmax)
+            except Exception as e:
+                log.warning("Tile render failed for %s z=%s: %s", tif_path, z, e)
+                return _empty_tile()
 
 # ── FastAPI app ────────────────────────────────────────
 app = FastAPI(title="Vietnam GIS Explorer", version="1.0")
@@ -144,6 +286,43 @@ def _safe(name: str) -> str:
 
 def _pdir(name: str) -> Path:
     return DATA_DIR / _safe(name)
+
+def _collected_dir_for_province(name: str) -> Optional[Path]:
+    mapped = COLLECTED_PROVINCE_MAP.get(name)
+    if not mapped:
+        return None
+    p = COLLECTED_DIR / mapped
+    return p if p.exists() else None
+
+def _resolve_raster_path(pdir: Path, province_name: str, layer: str) -> Optional[Path]:
+    tif = pdir / f"{layer}.tif"
+    if not tif.exists():
+        tif = pdir / "native" / f"{layer}.tif"
+    if tif.exists():
+        return tif
+    cdir = _collected_dir_for_province(province_name)
+    if cdir:
+        tif2 = cdir / f"{layer}.tif"
+        if tif2.exists():
+            return tif2
+    return None
+
+def _resolve_vector_path(pdir: Path, province_name: str, layer: str) -> Optional[Path]:
+    ext_map = {"roads": ".gpkg", "rivers": ".gpkg",
+               "infrastructure": ".gpkg", "contour": ".shp",
+               "real_ls_point": ".shp"}
+    ext = ext_map.get(layer)
+    if not ext:
+        return None
+    fp = pdir / f"{layer}{ext}"
+    if fp.exists():
+        return fp
+    cdir = _collected_dir_for_province(province_name)
+    if cdir:
+        fp2 = cdir / f"{layer}{ext}"
+        if fp2.exists():
+            return fp2
+    return None
 
 def _resolve(query: str) -> Optional[str]:
     """Match a query string to a canonical 2025 province name."""
@@ -260,7 +439,7 @@ def _build_merged_boundaries():
 
 # ── Auto-scale: percentile-based vmin/vmax ─────────────
 
-def _get_layer_range(pdir: Path, layer: str) -> Tuple[float, float]:
+def _get_layer_range_for_tif(pdir: Path, layer: str, tif: Path) -> Tuple[float, float]:
     """Return (vmin, vmax) for a raster layer, preferring sidecar stats JSON."""
     safe_name = pdir.name
     key = (safe_name, layer)
@@ -270,18 +449,12 @@ def _get_layer_range(pdir: Path, layer: str) -> Tuple[float, float]:
     cfg = LAYER_CONFIG.get(layer)
     fallback = (cfg["vmin"], cfg["vmax"]) if cfg else (0, 1)
 
-    tif = pdir / f"{layer}.tif"
-    if not tif.exists():
-        tif = pdir / "native" / f"{layer}.tif"
-    if not tif.exists():
-        _stats_cache[key] = fallback
-        return fallback
-
     stats_file = tif.with_suffix(".stats.json")
     if stats_file.exists():
         try:
             s = json.loads(stats_file.read_text())
-            result = (float(s["vmin"]), float(s["vmax"]))
+            # Stable rounding keeps LRU tile cache keys consistent across requests.
+            result = (round(float(s["vmin"]), 4), round(float(s["vmax"]), 4))
             _stats_cache[key] = result
             return result
         except Exception:
@@ -297,8 +470,8 @@ def _get_layer_range(pdir: Path, layer: str) -> Tuple[float, float]:
         if len(valid) == 0:
             _stats_cache[key] = fallback
             return fallback
-        vmin = float(np.percentile(valid, 2))
-        vmax = float(np.percentile(valid, 98))
+        vmin = round(float(np.percentile(valid, 2)), 4)
+        vmax = round(float(np.percentile(valid, 98)), 4)
         if vmax - vmin < 1e-6:
             vmin, vmax = fallback
         _stats_cache[key] = (vmin, vmax)
@@ -306,6 +479,17 @@ def _get_layer_range(pdir: Path, layer: str) -> Tuple[float, float]:
     except Exception:
         _stats_cache[key] = fallback
         return fallback
+
+
+def _get_layer_range(pdir: Path, layer: str) -> Tuple[float, float]:
+    """Backwards-compatible wrapper for province rasters."""
+    tif = pdir / f"{layer}.tif"
+    if not tif.exists():
+        tif = pdir / "native" / f"{layer}.tif"
+    if not tif.exists():
+        cfg = LAYER_CONFIG.get(layer)
+        return (cfg["vmin"], cfg["vmax"]) if cfg else (0, 1)
+    return _get_layer_range_for_tif(pdir, layer, tif)
 
 
 # ── Tile renderer ──────────────────────────────────────
@@ -316,6 +500,19 @@ for _cls_id, (_, _, _hex) in LANDCOVER_CLASSES.items():
         _LC_LUT[_cls_id] = [int(_hex[1:3], 16), int(_hex[3:5], 16),
                             int(_hex[5:7], 16), 220]
 
+_CLSI_LUT = np.zeros((256, 4), dtype=np.uint8)
+# 1-5: rất thấp, thấp, trung bình, cao, rất cao
+_CLSI_COLORS = {
+    1: "#2c7bb6",  # very low (blue)
+    2: "#abd9e9",  # low (light blue)
+    3: "#ffffbf",  # medium (yellow)
+    4: "#fdae61",  # high (orange)
+    5: "#d7191c",  # very high (red)
+}
+for _k, _hex in _CLSI_COLORS.items():
+    _CLSI_LUT[_k] = [int(_hex[1:3], 16), int(_hex[3:5], 16),
+                     int(_hex[5:7], 16), 230]
+
 def _render_tile(data: np.ndarray, mask: np.ndarray, layer: str,
                  vmin: float = 0, vmax: float = 1) -> bytes:
     """Colorize a single-band tile array to RGBA PNG bytes."""
@@ -324,6 +521,10 @@ def _render_tile(data: np.ndarray, mask: np.ndarray, layer: str,
     if layer == "landcover":
         idx = np.clip(data.astype(int), 0, 255)
         rgba = _LC_LUT[idx].copy()
+        rgba[mask == 0, 3] = 0
+    elif layer == "c_lsi":
+        idx = np.clip(data.astype(int), 0, 255)
+        rgba = _CLSI_LUT[idx].copy()
         rgba[mask == 0, 3] = 0
     else:
         cfg = LAYER_CONFIG.get(layer, {"cmap": "viridis"})
@@ -396,16 +597,13 @@ async def province_layers(name: str):
         return {"raster": [], "vector": []}
 
     rasters = []
-    for lyr in ["hillshade", "dem", "slope", "aspect", "landcover"]:
-        for sub in ["", "native"]:
-            p = pdir / sub / f"{lyr}.tif" if sub else pdir / f"{lyr}.tif"
-            if p.exists():
-                rasters.append(lyr)
-                break
+    for lyr in ["hillshade", "dem", "slope", "aspect", "landcover", "p_lsi", "c_lsi"]:
+        if _resolve_raster_path(pdir, matched, lyr):
+            rasters.append(lyr)
 
     vectors = []
-    for lyr, ext in [("infrastructure", ".gpkg"), ("contour", ".shp")]:
-        if (pdir / f"{lyr}{ext}").exists():
+    for lyr in ["infrastructure", "contour", "real_ls_point"]:
+        if _resolve_vector_path(pdir, matched, lyr):
             vectors.append(lyr)
 
     return {"raster": rasters, "vector": vectors}
@@ -440,14 +638,9 @@ async def province_vector(name: str, layer: str,
         raise HTTPException(404)
     pdir = _pdir(matched)
 
-    ext_map = {"roads": ".gpkg", "rivers": ".gpkg",
-               "infrastructure": ".gpkg", "contour": ".shp"}
-    ext = ext_map.get(layer)
-    if not ext:
-        raise HTTPException(404, f"Unknown vector layer: {layer}")
-    fp = pdir / f"{layer}{ext}"
-    if not fp.exists():
-        raise HTTPException(404, f"Layer '{layer}' not processed")
+    fp = _resolve_vector_path(pdir, matched, layer)
+    if not fp:
+        raise HTTPException(404, f"Unknown or missing vector layer: {layer}")
 
     gdf = gpd.read_file(fp)
     if gdf.crs and str(gdf.crs) != "EPSG:4326":
@@ -456,27 +649,26 @@ async def province_vector(name: str, layer: str,
         gdf["geometry"] = gdf.geometry.simplify(simplify)
     gdf = gdf[gdf.geometry.notnull()].copy()
 
+    # Do not expose precise landslide coordinates. Reduce precision of geometries
+    # before serializing (approx ~110m at 0.001 degrees).
+    if layer == "real_ls_point":
+        def _round_point_geom(geom):
+            try:
+                if geom is None or geom.is_empty:
+                    return geom
+                # Shapely Point
+                x, y = geom.x, geom.y
+                return type(geom)(round(float(x), 3), round(float(y), 3))
+            except Exception:
+                return geom
+        gdf["geometry"] = gdf.geometry.apply(_round_point_geom)
+
     # Large province-wide OSM layers can freeze the browser if sent raw.
     if len(gdf) > max_features:
         stride = max(1, int(math.ceil(len(gdf) / max_features)))
         gdf = gdf.iloc[::stride].copy()
 
     return JSONResponse(json.loads(gdf.to_json()))
-
-
-def _tile_bounds(z: int, x: int, y: int):
-    """Convert ZXY slippy-map tile to Web Mercator (EPSG:3857) bounds."""
-    n = 2.0 ** z
-    def _lng(tx):
-        return tx / n * 360.0 - 180.0
-    def _lat(ty):
-        lat_rad = math.atan(math.sinh(math.pi * (1 - 2 * ty / n)))
-        return math.degrees(lat_rad)
-    west, east = _lng(x), _lng(x + 1)
-    north, south = _lat(y), _lat(y + 1)
-    mx0, my0 = _TO_3857.transform(west, south)
-    mx1, my1 = _TO_3857.transform(east, north)
-    return mx0, my0, mx1, my1
 
 
 @app.get("/api/provinces/{name}/tiles/{layer}/{z}/{x}/{y}.png")
@@ -489,25 +681,19 @@ def tile(name: str, layer: str, z: int, x: int, y: int):
     headers = {"Cache-Control": "public, max-age=86400"}
 
     cache_path = pdir / "tiles" / layer / str(z) / str(x) / f"{y}.png"
-    if cache_path.exists():
-        return FileResponse(cache_path, media_type="image/png", headers=headers)
-
-    tif = pdir / f"{layer}.tif"
-    if not tif.exists():
-        tif = pdir / "native" / f"{layer}.tif"
-    if not tif.exists():
+    tif = _resolve_raster_path(pdir, matched, layer)
+    if not tif:
         return Response(content=_empty_tile(), media_type="image/png")
 
-    try:
-        src = _open_raster(str(tif))
-        src_bounds_3857 = transform_bounds(src.crs, "EPSG:3857", *src.bounds)
-        tb = _tile_bounds(z, x, y)
-        if (tb[2] < src_bounds_3857[0] or tb[0] > src_bounds_3857[2] or
-                tb[3] < src_bounds_3857[1] or tb[1] > src_bounds_3857[3]):
-            return Response(content=_empty_tile(), media_type="image/png")
+    if z < 0 or z > _MAX_TILE_ZOOM:
+        return Response(content=_empty_tile(), media_type="image/png")
 
-        vmin, vmax = _get_layer_range(pdir, layer)
-        content = _cached_tile_render(str(tif), layer, z, x, y, vmin, vmax)
+    if _png_tile_cache_valid(cache_path, tif):
+        return FileResponse(cache_path, media_type="image/png", headers=headers)
+
+    try:
+        vmin, vmax = _get_layer_range_for_tif(pdir, layer, tif)
+        content = _cached_tile_render(str(tif), layer, z, x, y, vmin, vmax, matched)
 
         try:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
