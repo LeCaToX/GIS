@@ -100,6 +100,18 @@ ESA_WC_BASE = "https://esa-worldcover.s3.eu-central-1.amazonaws.com/v200/2021/ma
 GEOFABRIK_VN_SHP_URL = "https://download.geofabrik.de/asia/vietnam-latest-free.shp.zip"
 GEOFABRIK_VN_PBF_URL = "https://download.geofabrik.de/asia/vietnam-latest.osm.pbf"
 
+# Public global thematic layers (no-auth, open access)
+# - NDVI: NASA Earth Observations (NEO) MOD_NDVI_16 (approximate values, visualization-grade)
+# - Geology (lithology classes): OpenLandMap (USGS EcoTapestry derived)
+# - Forest type: MODIS MCD12Q1 IGBP land cover type 1 (via OpenLandMap)
+NEO_VIEW_MOD_NDVI_16 = "https://neo.gsfc.nasa.gov/view.php?datasetId=MOD_NDVI_16"
+OPENLANDMAP_LITHOLOGY_COG = (
+    "https://s3.openlandmap.org/arco/lithology_usgs.ecotapestry_c_250m_s_20140101_20141231_go_epsg.4326_v1.0.tif"
+)
+OPENLANDMAP_MCD12Q1_T1_2021_COG = (
+    "https://s3.openlandmap.org/arco/lc_mcd12q1v061.t1_c_500m_s_20210101_20211231_go_epsg.4326_v20230818.tif"
+)
+
 LANDCOVER_CLASSES = {
     10: ("Tree cover", "Forest", "#006400"),
     20: ("Shrubland", "Shrubland", "#FFBB22"),
@@ -329,6 +341,34 @@ def download_file(url: str, dest: Path, desc: str = "", retries: int = 3) -> boo
     return False
 
 
+def download_http_stream(url: str, dest: Path, desc: str = "", retries: int = 3, timeout_s: int = 60) -> bool:
+    """Download via streaming GET (for endpoints that do not support HEAD well)."""
+    for attempt in range(retries):
+        try:
+            label = desc or url
+            log.info(f"  [v] Downloading {label} ...")
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with requests.get(url, stream=True, timeout=(15, timeout_s)) as r:
+                r.raise_for_status()
+                with open(dest, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+            mb = dest.stat().st_size / (1024 * 1024)
+            log.info(f"  [OK] Downloaded {label} ({mb:.1f} MB)")
+            return True
+        except Exception as e:
+            log.warning(f"  Attempt {attempt+1}/{retries} failed: {e}")
+            if dest.exists():
+                try:
+                    dest.unlink()
+                except Exception:
+                    pass
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
+    return False
+
+
 def _remote_last_modified_epoch(url: str) -> Optional[float]:
     """Return HTTP Last-Modified as epoch seconds, or None."""
     try:
@@ -542,6 +582,65 @@ def clip_raster_to_boundary(src_path: Path, dst_path: Path,
     with rasterio.open(dst_path, 'w', **profile) as dst:
         dst.write(clipped)
     _build_overviews(dst_path)
+
+
+def _clip_cog_url_to_boundary(url: str, out_path: Path,
+                              boundary: gpd.GeoDataFrame,
+                              dst_crs: str,
+                              resampling: Resampling = Resampling.nearest,
+                              nodata=None):
+    """Read a remote/local raster (COG recommended), window-read by boundary bbox, then clip + (optionally) reproject.
+
+    This is designed for global public layers (OpenLandMap, etc.) so we don't download the whole world.
+    """
+    boundary_ll = boundary.to_crs("EPSG:4326")
+    b = boundary_ll.total_bounds  # lon/lat
+    with rasterio.open(url) as src:
+        src_crs = src.crs
+        if src_crs is None:
+            src_crs = "EPSG:4326"
+        # Window in source CRS (assume EPSG:4326 for these global layers)
+        win = rasterio.windows.from_bounds(b[0], b[1], b[2], b[3], transform=src.transform)
+        win = win.round_offsets().round_lengths()
+        data = src.read(1, window=win)
+        tf = src.window_transform(win)
+        nd = src.nodata if nodata is None else nodata
+
+        # Write a temp subset in source CRS, then use existing clip util (which handles crop + nodata)
+        tmp = out_path.with_suffix(".subset.tif")
+        write_raster(data, tmp, src.crs, tf, nodata=nd, dtype=str(data.dtype))
+
+    # Reproject subset to desired CRS/grid if needed
+    if str(src_crs) != str(dst_crs):
+        tmp2 = out_path.with_suffix(".reproj.tif")
+        # Use rasterio reproject to new CRS at approx same resolution
+        with rasterio.open(tmp) as s:
+            dst_tf, dst_w, dst_h = calculate_default_transform(s.crs, dst_crs, s.width, s.height, *s.bounds)
+            dst_nd = s.nodata
+            dst = np.full((dst_h, dst_w), dst_nd if dst_nd is not None else 0, dtype=s.dtypes[0])
+            reproject(
+                source=rasterio.band(s, 1),
+                destination=dst,
+                src_transform=s.transform,
+                src_crs=s.crs,
+                dst_transform=dst_tf,
+                dst_crs=dst_crs,
+                src_nodata=s.nodata,
+                dst_nodata=dst_nd,
+                resampling=resampling,
+            )
+        write_raster(dst, tmp2, dst_crs, dst_tf, nodata=dst_nd if dst_nd is not None else 0, dtype=str(dst.dtype))
+        tmp.unlink(missing_ok=True)
+        tmp = tmp2
+
+    # Final clip to boundary in dst CRS
+    clip_raster_to_boundary(tmp, out_path, boundary, dst_crs)
+    try:
+        tmp.unlink()
+    except Exception:
+        pass
+    _write_layer_stats(out_path)
+    return out_path
 
 
 # ════════════════════════════════════════════════════════
@@ -810,25 +909,96 @@ def step_terrain(dem_path: Path, output_dir: Path,
     log.info("  Computing slope & aspect...")
     slope, aspect = _slope_aspect(dem_data, cs)
 
+    log.info("  Computing curvature...")
+    curvature = _curvature(dem_data, cs)
+
+    log.info("  Computing flow accumulation (D8)...")
+    # Use a filled DEM for stable routing (still masked later)
+    flow_acc = _flow_accumulation(dem_data.astype(np.float32))
+
+    log.info("  Computing TWI / SPI / STI...")
+    # Convert slope to radians for tan/sin; guard against zeros.
+    slope_rad = np.radians(slope.astype(np.float32))
+    tan_slope = np.tan(slope_rad)
+    sin_slope = np.sin(slope_rad)
+    tan_slope = np.maximum(tan_slope, 1e-6)
+    sin_slope = np.maximum(sin_slope, 1e-6)
+
+    # Use contributing area proxy (cells) -> approximate specific catchment area.
+    # (This is sufficient for relative-index mapping at province scale.)
+    a = np.maximum(flow_acc, 1.0)
+    twi = np.log(a / tan_slope).astype(np.float32)
+    spi = np.log(a * tan_slope).astype(np.float32)
+
+    # Sediment Transport Index (Moore & Burch style; common LS mapping defaults)
+    # STI = ( (a * cs / 22.13)^m ) * ( (sin(slope) / 0.0896)^n )
+    m, n = 0.4, 1.3
+    sti = ((a * cs / 22.13) ** m) * ((sin_slope / 0.0896) ** n)
+    sti = sti.astype(np.float32)
+
+    log.info("  Computing TRI (terrain ruggedness index)...")
+    # TRI = std-dev of elevation in a 3x3 neighborhood (Riley et al. variant).
+    try:
+        from scipy.ndimage import generic_filter
+
+        def _nanstd(w):
+            w = np.asarray(w, dtype=np.float32)
+            w = w[~np.isnan(w)]
+            return float(np.std(w)) if w.size else np.nan
+
+        tri = generic_filter(dem_data.astype(np.float32), _nanstd, size=3, mode="nearest")
+        tri = tri.astype(np.float32)
+    except Exception:
+        # Fallback: rough proxy using gradients.
+        dy, dx = np.gradient(dem_data.astype(np.float32), cs)
+        tri = np.sqrt(dx * dx + dy * dy).astype(np.float32)
+
+    log.info("  Computing SDC (slope degree classes)...")
+    # SDC = categorical slope class raster (useful for mapping + modelling).
+    # Classes: 1:0–5, 2:5–15, 3:15–30, 4:30–45, 5:>45 (degrees)
+    sdc = np.zeros_like(slope, dtype=np.uint8)
+    sdc[(slope >= 0) & (slope < 5)] = 1
+    sdc[(slope >= 5) & (slope < 15)] = 2
+    sdc[(slope >= 15) & (slope < 30)] = 3
+    sdc[(slope >= 30) & (slope < 45)] = 4
+    sdc[(slope >= 45)] = 5
+
     log.info("  Computing hillshade...")
     dem_valid = dem_data.copy()
     dem_valid[np.isnan(dem_valid)] = 0
     hillshade = _compute_hillshade(dem_valid, cs).astype(np.float32)
     hillshade[nodata_mask] = -9999
 
-    for arr in [dem_utm, slope, aspect]:
+    for arr in [dem_utm, slope, aspect, curvature, flow_acc, twi, spi, sti, tri]:
         arr[nodata_mask] = -9999
+    sdc[nodata_mask] = 0
 
     native = output_dir / "native"
     native.mkdir(exist_ok=True)
     results = {}
-    for name, data in [('hillshade', hillshade), ('dem', dem_utm),
-                       ('slope', slope), ('aspect', aspect)]:
+    for name, data in [
+        ('hillshade', hillshade),
+        ('dem', dem_utm),
+        ('slope', slope),
+        ('aspect', aspect),
+        ('curvature', curvature),
+        ('flow_accumulation', flow_acc),
+        ('twi', twi),
+        ('spi', spi),
+        ('sti', sti),
+        ('tri', tri),
+    ]:
         p = native / f"{name}.tif"
         write_raster(data, p, target_crs, tf)
         _write_layer_stats(p)
         results[name] = p
         log.info(f"  {name}: {p}")
+
+    # Categorical outputs
+    sdc_path = native / "sdc.tif"
+    write_raster(sdc, sdc_path, target_crs, tf, nodata=0, dtype="uint8")
+    results["sdc"] = sdc_path
+    log.info(f"  sdc: {sdc_path}")
 
     return results
 
@@ -1081,6 +1251,107 @@ def step_landcover(boundary: gpd.GeoDataFrame, output_dir: Path) -> Optional[Pat
     log.info(f"  ✅ Landcover: {lc_path}")
     return lc_path
 
+
+# ════════════════════════════════════════════════════════
+#  STEP 6a: NDVI (NASA NEO MOD_NDVI_16)
+# ════════════════════════════════════════════════════════
+def step_ndvi(boundary: gpd.GeoDataFrame, output_dir: Path,
+              target_crs: str) -> Optional[Path]:
+    """Fetch latest MODIS NDVI (16-day) from NASA NEO as floating GeoTIFF and clip to province.
+
+    Note: NEO floating GeoTIFF values are visualization-grade approximations.
+    """
+    log.info("═" * 60)
+    log.info("🌱 STEP 6a: NDVI (NASA NEO MOD_NDVI_16, 16-day)")
+    log.info("═" * 60)
+
+    raw_dir = output_dir / "raw" / "ndvi"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    ndvi_out = output_dir / "native" / "ndvi.tif"
+    ndvi_out.parent.mkdir(exist_ok=True)
+
+    # Grab the latest scene id (si=...) from the NEO dataset page.
+    try:
+        html = requests.get(NEO_VIEW_MOD_NDVI_16, timeout=(10, 30)).text
+        import re
+        m = re.search(r"RenderData\\?si=(\\d+)", html)
+        if not m:
+            log.warning("  ⚠ Could not parse NEO scene id for NDVI; skipping")
+            return None
+        si = m.group(1)
+        # Floating point GeoTIFF. NEO uses the same RenderData endpoint; format names vary slightly.
+        # We try a couple of known variants.
+        candidates = [
+            f"https://neo.gsfc.nasa.gov/servlet/RenderData?si={si}&cs=gs&format=GeoTIFF_Float&width=3600&height=1800",
+            f"https://neo.gsfc.nasa.gov/servlet/RenderData?si={si}&cs=gs&format=GEOTIFF_FLOAT&width=3600&height=1800",
+        ]
+        ndvi_raw = raw_dir / f"MOD_NDVI_16_si{si}.tif"
+        if not ndvi_raw.exists():
+            ok = False
+            for u in candidates:
+                if download_http_stream(u, ndvi_raw, desc="NEO NDVI (float GeoTIFF)", retries=2, timeout_s=120):
+                    ok = True
+                    break
+            if not ok:
+                log.warning("  ⚠ NDVI download failed; skipping")
+                return None
+    except Exception as e:
+        log.warning(f"  ⚠ NDVI fetch failed: {e}")
+        return None
+
+    # Clip/reproject to map CRS
+    try:
+        _clip_cog_url_to_boundary(str(ndvi_raw), ndvi_out, boundary, target_crs,
+                                  resampling=Resampling.bilinear, nodata=-9999.0)
+        log.info(f"  ✅ NDVI: {ndvi_out}")
+        return ndvi_out
+    except Exception as e:
+        log.warning(f"  ⚠ NDVI processing failed: {e}")
+        return None
+
+
+# ════════════════════════════════════════════════════════
+#  STEP 6d: Geology (Lithology classes - OpenLandMap)
+# ════════════════════════════════════════════════════════
+def step_geology(boundary: gpd.GeoDataFrame, output_dir: Path,
+                 target_crs: str) -> Optional[Path]:
+    """Fetch lithology classes (proxy for geology) from OpenLandMap and clip to province."""
+    log.info("═" * 60)
+    log.info("🪨 STEP 6d: Geology (Lithology classes - OpenLandMap)")
+    log.info("═" * 60)
+
+    out = output_dir / "native" / "geology_lithology.tif"
+    out.parent.mkdir(exist_ok=True)
+    try:
+        _clip_cog_url_to_boundary(OPENLANDMAP_LITHOLOGY_COG, out, boundary, target_crs,
+                                  resampling=Resampling.nearest, nodata=0)
+        log.info(f"  ✅ Geology (lithology): {out}")
+        return out
+    except Exception as e:
+        log.warning(f"  ⚠ Geology fetch failed: {e}")
+        return None
+
+
+# ════════════════════════════════════════════════════════
+#  STEP 6e: Forest type (MODIS MCD12Q1 IGBP type1 - OpenLandMap)
+# ════════════════════════════════════════════════════════
+def step_forest_type(boundary: gpd.GeoDataFrame, output_dir: Path,
+                     target_crs: str) -> Optional[Path]:
+    """Fetch MODIS land cover type 1 (IGBP) and clip to province (forest types are a subset of classes)."""
+    log.info("═" * 60)
+    log.info("🌲 STEP 6e: Forest Type (MODIS MCD12Q1 IGBP - OpenLandMap)")
+    log.info("═" * 60)
+
+    out = output_dir / "native" / "forest_type_igbp.tif"
+    out.parent.mkdir(exist_ok=True)
+    try:
+        _clip_cog_url_to_boundary(OPENLANDMAP_MCD12Q1_T1_2021_COG, out, boundary, target_crs,
+                                  resampling=Resampling.nearest, nodata=0)
+        log.info(f"  ✅ Forest type (IGBP): {out}")
+        return out
+    except Exception as e:
+        log.warning(f"  ⚠ Forest type fetch failed: {e}")
+        return None
 
 # ════════════════════════════════════════════════════════
 #  STEP 6b: POPULATION (GSO Vietnam – Tổng cục Thống kê)
@@ -2033,8 +2304,12 @@ def step_maps(output_dir: Path, boundary: gpd.GeoDataFrame, target_crs: str,
         'slope':             ('Slope Angle',              'YlOrRd',     'Degrees (°)',     True),
         'aspect':            ('Aspect (Compass Direction)', 'twilight',  'Degrees (°)',     False),
         'curvature':         ('Profile Curvature',        'RdBu_r',     'Curvature',       True),
+        'tri':               ('TRI — Terrain Ruggedness',  'magma',      'Ruggedness',      True),
         'flow_accumulation': ('Flow Accumulation (D8)',    'Blues',      'Upstream Cells',  True),
+        'spi':               ('SPI — Stream Power Index',  'inferno',    'SPI',             True),
         'twi':               ('Topographic Wetness Index', 'YlGnBu',    'TWI',             True),
+        'sti':               ('STI — Sediment Transport',  'plasma',     'STI',             True),
+        'ndvi':              ('NDVI (MODIS - NASA NEO)',   'YlGn',       'NDVI',            False),
     }
     for name, (title, cmap, label, use_hs) in raster_configs.items():
         if name in raster_paths and raster_paths[name].exists():
@@ -2054,6 +2329,55 @@ def step_maps(output_dir: Path, boundary: gpd.GeoDataFrame, target_crs: str,
     if 'landcover' in raster_paths and raster_paths['landcover'].exists():
         _save_landcover_map(raster_paths['landcover'], boundary, target_crs,
                             maps_dir / "landcover.png", internal_boundaries=ib)
+
+    # Geology (lithology classes)
+    if 'geology' in raster_paths and raster_paths['geology'].exists():
+        _save_raster_map(raster_paths['geology'], boundary, target_crs,
+                         "Geology — Lithology Classes (OpenLandMap)",
+                         maps_dir / "geology.png",
+                         cmap='tab20', label='Class', hillshade=False,
+                         internal_boundaries=ib)
+
+    # Forest type (IGBP land cover classes)
+    if 'forest_type' in raster_paths and raster_paths['forest_type'].exists():
+        _save_raster_map(raster_paths['forest_type'], boundary, target_crs,
+                         "Forest Type (MODIS IGBP classes, 2021)",
+                         maps_dir / "forest_type.png",
+                         cmap='tab20', label='Class', hillshade=False,
+                         internal_boundaries=ib)
+
+    # SDC (slope degree classes) categorical
+    if 'sdc' in raster_paths and raster_paths['sdc'].exists():
+        # Reuse landcover-style categorical rendering with a small custom palette
+        # by mapping classes to colors via imshow + legend.
+        boundary_utm = boundary.to_crs(target_crs)
+        ib_utm = ib.to_crs(target_crs) if ib is not None else None
+        fig, ax = _make_fig(boundary_utm, "SDC — Slope Degree Classes", internal_boundaries_utm=ib_utm)
+        data, tf, nd = _read_raster_for_map(raster_paths['sdc'], target_crs, resampling=Resampling.nearest)
+        extent = [tf[2], tf[2] + tf[0] * data.shape[1],
+                  tf[5] + tf[4] * data.shape[0], tf[5]]
+        sdc_colors = ['#00000000', '#C8E6C9', '#FFE082', '#FFB74D', '#E57373', '#8E24AA']
+        cmap = mcolors.ListedColormap(sdc_colors)
+        plot = data.astype(float)
+        plot[plot == 0] = np.nan
+        ax.imshow(plot, extent=extent, cmap=cmap, origin='upper', alpha=0.92, zorder=1, interpolation='nearest')
+        patches = [
+            Patch(facecolor=sdc_colors[1], edgecolor='#555555', linewidth=0.5, label='  0–5°'),
+            Patch(facecolor=sdc_colors[2], edgecolor='#555555', linewidth=0.5, label='  5–15°'),
+            Patch(facecolor=sdc_colors[3], edgecolor='#555555', linewidth=0.5, label='  15–30°'),
+            Patch(facecolor=sdc_colors[4], edgecolor='#555555', linewidth=0.5, label='  30–45°'),
+            Patch(facecolor=sdc_colors[5], edgecolor='#555555', linewidth=0.5, label='  >45°'),
+        ]
+        leg = ax.legend(handles=patches, loc='lower right', fontsize=7.5,
+                        framealpha=0.95, edgecolor=_ARCGIS_FRAME,
+                        fancybox=False, title='Slope classes', title_fontsize=8,
+                        borderpad=0.8)
+        leg.get_frame().set_linewidth(0.8)
+        leg.get_title().set_fontweight('bold')
+        ax.set_xlim(extent[0], extent[1])
+        ax.set_ylim(extent[2], extent[3])
+        _finalize_map(fig, ax, maps_dir / "sdc.png", transform=tf,
+                      attribution='Derived: DEM → slope classes')
 
     # Distance rasters
     for name, path in dist_paths.items():
@@ -2151,7 +2475,10 @@ def step_stack(raster_paths: dict, dist_paths: dict, output_dir: Path, grid: dic
 # ════════════════════════════════════════════════════════
 def _run_single_province(province: str, contour_interval: float,
                          output_dir: Path, legacy_boundaries: bool,
-                         osm_source: str, refresh_vn_data: bool):
+                         osm_source: str, refresh_vn_data: bool,
+                         ndvi_path: Optional[str] = None,
+                         geology_path: Optional[str] = None,
+                         forest_type_path: Optional[str] = None):
     """Run pipeline for one province — generates only what the web map needs."""
     log.info("[*] VIETNAM GIS PIPELINE")
     log.info(f"   Province:   {province}")
@@ -2191,6 +2518,11 @@ def _run_single_province(province: str, contour_interval: float,
     # ── Step 6: Land cover ──
     lc_path = step_landcover(boundary, output_dir)
 
+    # ── Step 6a/6d/6e: NDVI + Geology + Forest type (public sources) ──
+    ndvi_auto = step_ndvi(boundary, output_dir, target_crs)
+    geology_auto = step_geology(boundary, output_dir, target_crs)
+    forest_auto = step_forest_type(boundary, output_dir, target_crs)
+
     # ── Step 7: Population (GSO) ──
     gso_pop = step_population(boundary, internal_boundaries, output_dir)
 
@@ -2199,18 +2531,53 @@ def _run_single_province(province: str, contour_interval: float,
         boundary, internal_boundaries, gso_pop, lc_path,
         terrain_paths, osm_paths, target_crs, output_dir)
 
+    # ── Step 7: Drainage proximity (distance-to) rasters ──
+    # Build a grid matching the native DEM cellsize for fast processing.
+    grid = compute_target_grid(boundary, target_crs, res=float(cs))
+    dist_paths = step_distance(osm_paths, grid, boundary, output_dir)
+
+    # ── Optional: NDVI / Geology / Forest type (user-provided sources) ──
+    optional_rasters: Dict[str, Path] = {}
+    if ndvi_path:
+        p = Path(ndvi_path)
+        if p.exists():
+            optional_rasters["ndvi"] = p
+        else:
+            log.warning(f"  ⚠ NDVI path not found: {p}")
+
+    optional_vectors: Dict[str, Optional[Path]] = {}
+    if geology_path:
+        p = Path(geology_path)
+        if p.exists():
+            optional_vectors["geology"] = p
+        else:
+            log.warning(f"  ⚠ Geology path not found: {p}")
+    if forest_type_path:
+        p = Path(forest_type_path)
+        if p.exists():
+            optional_vectors["forest_type"] = p
+        else:
+            log.warning(f"  ⚠ Forest type path not found: {p}")
+
     # ── Step 9: PNG maps (optional but expected) ──
     # Use whatever layers we have available at this point.
     raster_paths = dict(terrain_paths)
     if lc_path is not None:
         raster_paths["landcover"] = lc_path
+    if ndvi_auto is not None:
+        raster_paths["ndvi"] = ndvi_auto
+    if geology_auto is not None:
+        raster_paths["geology"] = geology_auto
+    if forest_auto is not None:
+        raster_paths["forest_type"] = forest_auto
+    raster_paths.update(optional_rasters)
     step_maps(
         output_dir=output_dir,
         boundary=boundary,
         target_crs=target_crs,
         raster_paths=raster_paths,
-        osm_paths=osm_paths,
-        dist_paths={},
+        osm_paths={**osm_paths, **optional_vectors},
+        dist_paths=dist_paths,
         contour_path=contour_path,
         gso_pop=gso_pop,
         internal_boundaries=internal_boundaries,
@@ -2249,8 +2616,15 @@ def _run_single_province(province: str, contour_interval: float,
               default='geofabrik', hidden=True)
 @click.option('--refresh-vn-data', is_flag=True, default=False, hidden=True)
 @click.option('--crawl-vn-data-only', is_flag=True, default=False, hidden=True)
+@click.option('--ndvi-path', default=None, type=str,
+              help='Optional NDVI raster (GeoTIFF). If provided, a PNG is generated.')
+@click.option('--geology-path', default=None, type=str,
+              help='Optional geology layer (GeoPackage/GeoJSON/Shapefile). If provided, a PNG is generated.')
+@click.option('--forest-type-path', default=None, type=str,
+              help='Optional forest type layer (GeoPackage/GeoJSON/Shapefile). If provided, a PNG is generated.')
 def main(province, list_provinces, contour_interval, output_dir,
-         legacy_boundaries, osm_source, refresh_vn_data, crawl_vn_data_only):
+         legacy_boundaries, osm_source, refresh_vn_data, crawl_vn_data_only,
+         ndvi_path, geology_path, forest_type_path):
     """
     Vietnam GIS Pipeline.
 
@@ -2284,7 +2658,10 @@ def main(province, list_provinces, contour_interval, output_dir,
         safe_name = province.replace(" ", "_").replace(".", "")
         out_dir = Path(output_dir) if output_dir else Path("data") / "province" / safe_name
         _run_single_province(province, contour_interval, out_dir,
-                             legacy_boundaries, osm_source, refresh_vn_data)
+                             legacy_boundaries, osm_source, refresh_vn_data,
+                             ndvi_path=ndvi_path,
+                             geology_path=geology_path,
+                             forest_type_path=forest_type_path)
         return
 
     base_out = Path(output_dir) if output_dir else Path("data") / "province"
