@@ -1635,6 +1635,52 @@ def _finalize_map(fig, ax, out_png, transform=None, attribution=None):
     log.info(f"  🗺️  {out_png.name}")
 
 
+def _read_raster_for_map(raster_path: Path, target_crs: str,
+                         resampling: Resampling = Resampling.bilinear):
+    """Read a raster and (if needed) reproject it to the map CRS.
+
+    This prevents CRS mismatches (e.g., EPSG:4326 rasters plotted under UTM boundaries)
+    that can explode the figure extent and crash Matplotlib.
+    """
+    with rasterio.open(raster_path) as src:
+        data = src.read(1)
+        tf = src.transform
+        crs = src.crs
+        nd = src.nodata
+
+        if crs is None or str(crs) == str(target_crs):
+            return data, tf, nd
+
+        dst_tf, dst_w, dst_h = calculate_default_transform(
+            crs, target_crs, src.width, src.height, *src.bounds
+        )
+
+        # Choose a nodata that matches dtype when missing.
+        if nd is None:
+            if np.issubdtype(data.dtype, np.unsignedinteger):
+                dst_nd = 0
+            elif np.issubdtype(data.dtype, np.integer):
+                dst_nd = -9999
+            else:
+                dst_nd = -9999.0
+        else:
+            dst_nd = nd
+
+        dst = np.full((dst_h, dst_w), dst_nd, dtype=data.dtype)
+        reproject(
+            source=data,
+            destination=dst,
+            src_transform=tf,
+            src_crs=crs,
+            dst_transform=dst_tf,
+            dst_crs=target_crs,
+            src_nodata=nd,
+            dst_nodata=dst_nd,
+            resampling=resampling,
+        )
+        return dst, dst_tf, dst_nd
+
+
 def _save_raster_map(raster_path: Path, boundary: gpd.GeoDataFrame,
                      target_crs: str, title: str, out_png: Path,
                      cmap='terrain', vmin=None, vmax=None, label='',
@@ -1645,10 +1691,7 @@ def _save_raster_map(raster_path: Path, boundary: gpd.GeoDataFrame,
     ib_utm = internal_boundaries.to_crs(target_crs) if internal_boundaries is not None else None
     fig, ax = _make_fig(boundary_utm, title, internal_boundaries_utm=ib_utm)
 
-    with rasterio.open(raster_path) as src:
-        data = src.read(1)
-        tf = src.transform
-        nd = src.nodata
+    data, tf, nd = _read_raster_for_map(raster_path, target_crs, resampling=Resampling.bilinear)
 
     data_plot = data.astype(float)
     if nd is not None:
@@ -1666,10 +1709,10 @@ def _save_raster_map(raster_path: Path, boundary: gpd.GeoDataFrame,
     if hillshade:
         hs_data = None
         if dem_path and dem_path.exists():
-            with rasterio.open(dem_path) as dem_src:
-                hs_data = dem_src.read(1).astype(float)
-                if dem_src.nodata is not None:
-                    hs_data[dem_src.read(1) == dem_src.nodata] = np.nan
+            dem_data, dem_tf, dem_nd = _read_raster_for_map(dem_path, target_crs, resampling=Resampling.bilinear)
+            hs_data = dem_data.astype(float)
+            if dem_nd is not None:
+                hs_data[dem_data == dem_nd] = np.nan
         else:
             hs_data = data_plot.copy()
 
@@ -1702,9 +1745,7 @@ def _save_landcover_map(raster_path: Path, boundary: gpd.GeoDataFrame,
     fig, ax = _make_fig(boundary_utm, "Land Cover (ESA WorldCover 10m)",
                         internal_boundaries_utm=ib_utm)
 
-    with rasterio.open(raster_path) as src:
-        data = src.read(1)
-        tf = src.transform
+    data, tf, nd = _read_raster_for_map(raster_path, target_crs, resampling=Resampling.nearest)
 
     extent = [tf[2], tf[2] + tf[0] * data.shape[1],
               tf[5] + tf[4] * data.shape[0], tf[5]]
@@ -1718,6 +1759,8 @@ def _save_landcover_map(raster_path: Path, boundary: gpd.GeoDataFrame,
 
     data_plot = data.astype(float)
     data_plot[data == 0] = np.nan
+    if nd is not None:
+        data_plot[data == nd] = np.nan
 
     ax.imshow(data_plot, extent=extent, cmap=lc_cmap, norm=norm,
               origin='upper', alpha=0.92, zorder=1, interpolation='nearest')
