@@ -2533,7 +2533,12 @@ def _run_single_province(province: str, contour_interval: float,
 
     # ── Step 7: Drainage proximity (distance-to) rasters ──
     # Build a grid matching the native DEM cellsize for fast processing.
-    grid = compute_target_grid(boundary, target_crs, res=float(cs))
+    try:
+        with rasterio.open(terrain_paths["dem"]) as _ds:
+            _cs = float(abs(_ds.transform[0]))
+    except Exception:
+        _cs = 30.0
+    grid = compute_target_grid(boundary, target_crs, res=_cs)
     dist_paths = step_distance(osm_paths, grid, boundary, output_dir)
 
     # ── Optional: NDVI / Geology / Forest type (user-provided sources) ──
