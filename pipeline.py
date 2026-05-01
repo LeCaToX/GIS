@@ -32,6 +32,19 @@ import shutil
 import zipfile
 from email.utils import parsedate_to_datetime
 
+# Ensure Matplotlib can write its cache even on locked-down systems
+# (must be set before importing matplotlib).
+try:
+    _mpl_dir = os.environ.get("MPLCONFIGDIR")
+    if not _mpl_dir:
+        # Prefer a project-local cache directory; fallback to /tmp.
+        _local = Path("cache") / "matplotlib"
+        _local.mkdir(parents=True, exist_ok=True)
+        os.environ["MPLCONFIGDIR"] = str(_local)
+except Exception:
+    # As a last resort, let Matplotlib pick a temporary directory.
+    pass
+
 # Fix Windows terminal encoding + disable buffering
 os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
 try:
@@ -2126,7 +2139,7 @@ def _run_single_province(province: str, contour_interval: float,
     terrain_paths = step_terrain(dem_path, output_dir, boundary, target_crs)
 
     # ── Step 4: Contour lines ──
-    step_contour(terrain_paths['dem'], output_dir, contour_interval)
+    contour_path = step_contour(terrain_paths['dem'], output_dir, contour_interval)
 
     # ── Step 5: OSM infrastructure ──
     osm_paths = step_osm(boundary, output_dir, source=osm_source,
@@ -2142,6 +2155,24 @@ def _run_single_province(province: str, contour_interval: float,
     socio_stats = step_socioeconomic(
         boundary, internal_boundaries, gso_pop, lc_path,
         terrain_paths, osm_paths, target_crs, output_dir)
+
+    # ── Step 9: PNG maps (optional but expected) ──
+    # Use whatever layers we have available at this point.
+    raster_paths = dict(terrain_paths)
+    if lc_path is not None:
+        raster_paths["landcover"] = lc_path
+    step_maps(
+        output_dir=output_dir,
+        boundary=boundary,
+        target_crs=target_crs,
+        raster_paths=raster_paths,
+        osm_paths=osm_paths,
+        dist_paths={},
+        contour_path=contour_path,
+        gso_pop=gso_pop,
+        internal_boundaries=internal_boundaries,
+        socio_stats=socio_stats,
+    )
 
     # ── Summary ──
     log.info("")
